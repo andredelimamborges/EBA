@@ -539,7 +539,7 @@ def gerar_pdf_corporativo(bfa_data: Dict, analysis: Dict, cargo: str, save_path:
 # ... (mesmo código do chat anterior) ...
 
 # ======== UI helpers ========
-def kpi_card(title, value, sub=None):
+ def kpi_card(title, value, sub=None):
     st.markdown(
         f'<div class="kpi-card"><div style="font-weight:700;font-size:1.02rem">{title}</div>'
         f'<div style="font-size:1.9rem;margin:.2rem 0 .25rem 0">{value}</div>'
