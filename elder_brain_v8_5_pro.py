@@ -4,8 +4,7 @@ Elder Brain Analytics — PRO (Full) • PROD
 - TODAS as funcionalidades: Extração → Análise → Gráficos → PDF Deluxe → Chat → Treinamento
 - API keys lidas via st.secrets (não aparecem para o usuário)
 - Painel Administrativo protegido por senha (ADMIN_PASSWORD)
-- Custos e tokens visíveis somente ao Admin
-- Compatível com groq==0.8.0 (corrige erro de proxies)
+- Notificações por email gratuitas para Admin (substitui Sheets)
 Autor: André de Lima
 """
 
@@ -21,6 +20,9 @@ from fpdf import FPDF
 from pdfminer.high_level import extract_text
 import streamlit as st
 import httpx
+import smtplib  # NOVO: Para envio de emails
+from email.mime.text import MIMEText  # NOVO: Para formatar emails
+from email.mime.multipart import MIMEMultipart  # NOVO: Para emails com anexos se precisar
 
 # ======== LLM Clients ========
 try:
@@ -338,6 +340,79 @@ def _estimate_and_add(tracker, step, messages, content, usage):
     prompt_text = "\n".join([m.get("content","") for m in messages])
     tracker.add(step, _estimate_tokens(prompt_text), _estimate_tokens(content))
 
+# NOVO: Função para Enviar Notificação por Email ao Admin
+def send_admin_notification(tracker: TokenTracker, step: str, cargo: str, mode: str = "cada_uso"):
+    """
+    Envia email com relatório de tokens para o admin.
+    - mode: 'cada_uso' = envia por step; 'soma' = soma totais e envia só uma vez por sessão.
+    """
+    admin_email = st.secrets.get("ADMIN_EMAIL", "")
+    app_password = st.secrets.get("ADMIN_APP_PASSWORD", "")
+    if not admin_email or not app_password:
+        st.warning("Configurar ADMIN_EMAIL e ADMIN_APP_PASSWORD nos secrets para notificações.")
+        return
+
+    try:
+        # Config SMTP Gmail
+        smtp_server = "smtp.gmail.com"
+        port = 587
+        sender = admin_email
+        receiver = admin_email  # Envia para si mesmo
+
+        # Preparar mensagem
+        msg = MIMEMultipart()
+        msg['From'] = sender
+        msg['To'] = receiver
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        subject = f"Elder Brain: Relatório de Uso - Sessão {st.session_state.get('session_id', 'N/A')} ({step.upper()})"
+
+        if mode == "soma":
+            # Soma totais da sessão
+            body = f"""
+            <h2>Relatório Acumulado de Tokens (Sessão: {st.session_state.get('session_id', 'N/A')})</h2>
+            <p><strong>Data/Hora:</strong> {timestamp}</p>
+            <p><strong>Provedor/Modelo:</strong> {tracker.provider} / {tracker.model}</p>
+            <p><strong>Cargo:</strong> {cargo}</p>
+            <h3>Totais da Sessão:</h3>
+            <ul>
+                <li>Prompt Tokens: {tracker.total_prompt}</li>
+                <li>Completion Tokens: {tracker.total_completion}</li>
+                <li>Total Tokens: {tracker.total_tokens}</li>
+                <li>Custo Estimado (USD): ${tracker.cost_usd_gpt():.4f}</li>
+            </ul>
+            <h3>Por Step:</h3>
+            <ul>
+            """
+            for s, data in tracker.dict().items():
+                body += f"<li>{s.capitalize()}: {data['total']} tokens (prompt: {data['prompt']}, output: {data['completion']})</li>"
+            body += "</ul><p>--- Elder Brain Analytics ---</p>"
+        else:  # cada_uso
+            step_data = tracker.steps.get(step, TokenStep())
+            body = f"""
+            <h2>Relatório de Uso - {step.upper()}</h2>
+            <p><strong>Sessão:</strong> {st.session_state.get('session_id', 'N/A')}</p>
+            <p><strong>Data/Hora:</strong> {timestamp}</p>
+            <p><strong>Provedor/Modelo:</strong> {tracker.provider} / {tracker.model}</p>
+            <p><strong>Cargo:</strong> {cargo}</p>
+            <p><strong>Tokens neste Step:</strong> {step_data.total} (prompt: {step_data.prompt}, output: {step_data.completion})</p>
+            <p><strong>Custo Estimado Total até Agora (USD):</strong> ${tracker.cost_usd_gpt():.4f}</p>
+            <p>--- Elder Brain Analytics ---</p>
+            """
+
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'html'))  # HTML para melhor legibilidade
+
+        # Enviar
+        server = smtplib.SMTP(smtp_server, port)
+        server.starttls()
+        server.login(sender, app_password)
+        text = msg.as_string()
+        server.sendmail(sender, receiver, text)
+        server.quit()
+        print(f"Email enviado para {receiver} - {step}")  # Log no console
+    except Exception as e:
+        print(f"Erro ao enviar email: {e}")  # Silencia na UI
+
 # ======== Core IA ========
 def extract_bfa_data(text: str, cargo: str, training_context: str,
                      provider: str, model_id: str, token: str, tracker: TokenTracker
@@ -605,49 +680,6 @@ def kpi_card(title, value, sub=None):
 
 # ======== Imports Adicionais ========
 import uuid
-import gspread
-from google.oauth2.service_account import Credentials
-
-# ======== Função para Conectar à Sheet ========
-@st.cache_resource(show_spinner=False)
-def get_gsheet_client():
-    """Conecta à Google Sheets usando service account de st.secrets."""
-    try:
-        creds_json = json.loads(st.secrets.get("GOOGLE_SERVICE_ACCOUNT", "{}"))
-        creds = Credentials.from_service_account_info(creds_json, scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
-        client = gspread.authorize(creds)
-        sheet = client.open_by_id("1dW3Lvn9LrV6FgUshk4x2TwnJA1grM2iETThn3T3rAVw")
-        worksheet = sheet.worksheet("LogsUso")  # Assume aba "LogsUso" existe; crie manualmente se necessário
-        return worksheet
-    except Exception as e:
-        st.error(f"Erro ao conectar com Google Sheets: {e}")
-        return None
-
-# ======== Função para Logar Tokens ========
-def log_tokens_to_sheet(tracker: TokenTracker, step: str, cargo: str):
-    """Appenda log de tokens na Google Sheet."""
-    worksheet = get_gsheet_client()
-    if not worksheet:
-        return  # Silencia erro para não quebrar o app
-
-    try:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        step_data = tracker.steps.get(step, TokenStep())
-        row = [
-            now,
-            st.session_state['session_id'],
-            tracker.provider,
-            tracker.model,
-            cargo,
-            step,
-            step_data.prompt,
-            step_data.completion,
-            step_data.total,
-            tracker.cost_usd_gpt()  # Custo total da sessão até agora
-        ]
-        worksheet.append_row(row)
-    except Exception as e:
-        pass  # Silencia para não impactar UX
 
 # ======== APP ========
 def main():
@@ -665,6 +697,7 @@ def main():
     ss.setdefault('tracker', TokenTracker())
     ss.setdefault('admin_mode', False)   # sempre inicia como usuário comum
     ss.setdefault('session_id', str(uuid.uuid4()))  # ID único por sessão
+    ss.setdefault('email_mode', 'cada_uso')  # NOVO: Modo de email ('cada_uso' ou 'soma')
 
     # ===== Topo
     st.markdown("## 🧠 Elder Brain Analytics — Corporate (PROD • Full)")
@@ -700,6 +733,11 @@ def main():
         else:
             ss['admin_mode'] = False
 
+        # NOVO: Config de Email no Admin
+        if ss['admin_mode']:
+            ss['email_mode'] = st.selectbox("Modo de Notificação por Email", ["cada_uso", "soma"], help="'Cada uso': email por step; 'Soma': total no final.")
+            st.caption("Emails enviados para ADMIN_EMAIL (verifique spam se não chegar).")
+
         # 📈 Token Log — SOMENTE admin
         if ss['admin_mode']:
             st.markdown("---")
@@ -710,17 +748,6 @@ def main():
                 st.write(f"- **{step.capitalize()}**: {d['total']}  (prompt {d['prompt']} / output {d['completion']})")
             st.write(f"**Total:** {ss['tracker'].total_tokens} tokens")
             st.write(f"**Custo (estimado):** ${ss['tracker'].cost_usd_gpt():.4f}")
-            st.markdown("### 📊 Logs de Uso (Todos os Usuários)")
-            worksheet = get_gsheet_client()
-            if worksheet:
-                data = worksheet.get_all_values()
-                if len(data) > 1:  # Ignora header se vazio
-                    df_logs = pd.DataFrame(data[1:], columns=data[0])
-                    st.dataframe(df_logs, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Nenhum log registrado ainda.")
-            else:
-                st.warning("Não foi possível carregar logs da sheet.")
         else:
             st.caption("modo usuário — sem métricas financeiras visíveis")
 
@@ -770,7 +797,8 @@ def main():
 
             with st.spinner("Etapa 1/2: Extraindo dados estruturados..."):
                 bfa_data, raw1 = extract_bfa_data(raw_text, ss['cargo'], training_context, ss['provider'], ss['modelo'], token, tracker)
-                log_tokens_to_sheet(tracker, "extracao", ss['cargo'])
+                if ss['admin_mode']:  # NOVO: Envia notificação
+                    send_admin_notification(tracker, "extracao", ss['cargo'], ss['email_mode'])
             if not bfa_data:
                 st.error("Falha na extração"); 
                 with st.expander("Resposta bruta da IA"):
@@ -780,7 +808,11 @@ def main():
             perfil = gerar_perfil_cargo_dinamico(ss['cargo'])
             with st.spinner("Etapa 2/2: Analisando compatibilidade..."):
                 analysis, raw2 = analyze_bfa_data(bfa_data, ss['cargo'], perfil, ss['provider'], ss['modelo'], token, tracker)
-                log_tokens_to_sheet(tracker, "analise", ss['cargo'])
+                if ss['admin_mode']:  # NOVO: Envia notificação
+                    if ss['email_mode'] == 'cada_uso':
+                        send_admin_notification(tracker, "analise", ss['cargo'], ss['email_mode'])
+                    else:  # soma: envia total no final
+                        send_admin_notification(tracker, "analise", ss['cargo'], "soma")
             if not analysis:
                 st.error("Falha na análise");
                 with st.expander("Resposta bruta da IA"):
@@ -896,7 +928,8 @@ def main():
             path = os.path.join(PROCESSED_DIR, fname)
             buf = gerar_pdf_corporativo(ss['bfa_data'], ss['analysis'], ss['cargo'], save_path=path, logo_path=logo_path if logo_path else None)
             ss['tracker'].add("pdf", 0, 0)
-            log_tokens_to_sheet(ss['tracker'], "pdf", ss['cargo'])
+            if ss['admin_mode']:  # NOVO: Envia notificação
+                send_admin_notification(ss['tracker'], "pdf", ss['cargo'], ss['email_mode'])
             if buf.getbuffer().nbytes > 100:
                 ss['pdf_generated'] = {'buffer': buf, 'filename': fname}
                 st.success(f"✓ PDF gerado: {fname}")
@@ -912,7 +945,8 @@ def main():
             with st.spinner("Pensando..."):
                 ans = chat_with_elder_brain(q, ss['bfa_data'], ss['analysis'], ss['cargo'],
                                             ss['provider'], ss['modelo'], token, ss['tracker'])
-                log_tokens_to_sheet(ss['tracker'], "chat", ss['cargo'])
+                if ss['admin_mode']:  # NOVO: Envia notificação
+                    send_admin_notification(ss['tracker'], "chat", ss['cargo'], ss['email_mode'])
             st.markdown(f"**Você:** {q}")
             st.markdown(f"**Elder Brain:** {ans}")
 
