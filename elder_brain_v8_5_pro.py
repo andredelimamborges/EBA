@@ -1,15 +1,16 @@
 # elder_brain_v8_5_pro_prod_full_corrigido.py
 """
 Elder Brain Analytics — PRO (Full) • PROD
-- TODAS as funcionalidades: Extração → Análise → Gráficos → PDF Deluxe → Chat → Treinamento
-- API keys lidas via st.secrets (não aparecem para o usuário)
-- Painel Administrativo protegido por senha (ADMIN_PASSWORD)
-- Notificações por e-mail gratuitas (Gmail) – substitui Google Sheets
-- GRÁFICOS CORRIGIDOS (radar, barras, gauge) – sem mais PlotlyError
-Autor: André de Lima | Versão: 2025-11-04
+- Extração + Análise + Gráficos + PDF Deluxe + Chat + Treinamento
+- API keys via st.secrets
+- Painel Admin com senha
+- Notificações por e-mail (Gmail gratuito)
+- GRÁFICOS 100% CORRIGIDOS (sem PlotlyError)
+- INDENTAÇÃO CORRIGIDA (sem IndentationError)
+Autor: André de Lima | 2025-11-04
 """
 
-import os, io, re, json, time, tempfile, smtplib
+import os, io, re, json, time, smtplib
 from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -36,7 +37,7 @@ try:
 except Exception:
     OpenAI = None
 
-# ======== Token helpers (estimativa caso SDK não retorne usage) ========
+# ======== Token helpers ========
 try:
     import tiktoken
 except Exception:
@@ -49,12 +50,8 @@ os.makedirs(TRAINING_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
 MODELOS_SUGERIDOS_GROQ = [
-    "llama-3.1-8b-instant",
-    "llama-3.1-70b-versatile",
-    "mixtral-8x7b-32768",
-    "gemma2-9b-it",
-    "llama-3.2-1b-preview",
-    "llama-3.2-3b-preview",
+    "llama-3.1-8b-instant", "llama-3.1-70b-versatile", "mixtral-8x7b-32768",
+    "gemma2-9b-it", "llama-3.2-1b-preview", "llama-3.2-3b-preview"
 ]
 MODELOS_SUGERIDOS_OPENAI = ["gpt-4o-mini", "gpt-4o"]
 
@@ -63,7 +60,7 @@ TEMP_FIXED = 0.3
 GPT_PRICE_INPUT_PER_1K = 0.005
 GPT_PRICE_OUTPUT_PER_1K = 0.015
 
-# ======== Tema / CSS ========
+# ======== Tema CSS ========
 DARK_CSS = """
 <style>
 :root{
@@ -81,7 +78,7 @@ header[data-testid="stHeader"] { display:none !important; }
 </style>
 """
 
-# ======== Fontes (Montserrat opcional no PDF) ========
+# ======== Fontes PDF ========
 def _download_font(dst: str, url: str) -> bool:
     try:
         import requests
@@ -128,10 +125,7 @@ class TokenStep:
 @dataclass
 class TokenTracker:
     steps: Dict[str, TokenStep] = field(default_factory=lambda: {
-        "extracao": TokenStep(),
-        "analise": TokenStep(),
-        "chat": TokenStep(),
-        "pdf": TokenStep()
+        "extracao": TokenStep(), "analise": TokenStep(), "chat": TokenStep(), "pdf": TokenStep()
     })
     model: str = ""
     provider: str = ""
@@ -165,13 +159,12 @@ def _estimate_tokens(text: str) -> int:
         pass
     return max(1, int(len(text) / 4))
 
-# ======== Cliente seguro (sem proxy) ========
+# ======== Cliente LLM seguro ========
 @st.cache_resource(show_spinner=False)
 def get_llm_client_cached(provider: str, api_key: str):
     if not api_key:
-        raise RuntimeError("Chave da API não configurada. Defina nos Secrets do Streamlit.")
+        raise RuntimeError("Chave da API não configurada nos Secrets.")
     pv = (provider or "Groq").lower()
-
     if pv == "groq":
         try:
             from groq import Groq
@@ -280,95 +273,50 @@ def load_all_training_texts() -> str:
 
 def gerar_perfil_cargo_dinamico(cargo: str) -> Dict:
     return {
-        "traits_ideais": {"Abertura": (5,8), "Conscienciosidade": (6,9), "Extroversão": (4,8), "Amabilidade": (5,8), "Neuroticismo": (0,5)},
+        "traits_ideais": {
+            "Abertura": (5,8), "Conscienciosidade": (6,9), "Extroversão": (4,8),
+            "Amabilidade": (5,8), "Neuroticismo": (0,5)
+        },
         "competencias_criticas": ["Adaptabilidade","Comunicação","Trabalho em Equipe","Resolução de Problemas"],
         "descricao": f"Perfil para {cargo}"
     }
 
-# ======== Chat/Completion wrappers ========
-def _chat_completion_json(provider, client, model, messages, force_json=True):
-    usage = None
-    if (provider or "").lower() == "groq":
-        kwargs = dict(model=model, messages=messages, max_tokens=MAX_TOKENS_FIXED, temperature=TEMP_FIXED)
-        if force_json:
-            kwargs["response_format"] = {"type": "json_object"}
-        resp = client.chat.completions.create(**kwargs)
-        content = resp.choices[0].message.content.strip()
-        usage = getattr(resp, "usage", None)
-        if usage:
-            usage = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}
-        return content, usage
-    else:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages if not force_json else ([{"role":"system","content":"Responda apenas com JSON válido."}] + messages),
-            temperature=TEMP_FIXED,
-            max_tokens=MAX_TOKENS_FIXED,
-            response_format={"type":"json_object"} if force_json else None
-        )
-        content = resp.choices[0].message.content.strip()
-        usage = getattr(resp, "usage", None)
-        if usage:
-            usage = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}
-        return content, usage
-
-def _estimate_and_add(tracker, step, messages, content, usage):
-    if usage:
-        tracker.add(step, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-        return
-    prompt_text = "\n".join([m.get("content","") for m in messages])
-    tracker.add(step, _estimate_tokens(prompt_text), _estimate_tokens(content))
-
-# ======== NOTIFICAÇÃO POR E-MAIL (GRATUITA) ========
+# ======== Email Admin ========
 def send_admin_notification(tracker: TokenTracker, step: str, cargo: str, mode: str = "cada_uso"):
     admin_email = st.secrets.get("ADMIN_EMAIL", "")
     app_password = st.secrets.get("ADMIN_APP_PASSWORD", "")
     if not admin_email or not app_password:
         return
-
     try:
         smtp_server = "smtp.gmail.com"
         port = 587
-        sender = admin_email
-        receiver = admin_email
-
+        sender = receiver = admin_email
         msg = MIMEMultipart()
         msg['From'] = sender
         msg['To'] = receiver
+        msg['Subject'] = f"Elder Brain: Uso - {step.upper()} (Sessão: {st.session_state.get('session_id','N/A')})"
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        subject = f"Elder Brain: Uso - Sessão {st.session_state.get('session_id','N/A')} ({step.upper()})"
-        msg['Subject'] = subject
 
         if mode == "soma":
             body = f"""
-            <h2>Relatório Acumulado (Sessão: {st.session_state.get('session_id','N/A')})</h2>
-            <p><strong>Data/Hora:</strong> {timestamp}</p>
-            <p><strong>Provedor/Modelo:</strong> {tracker.provider} / {tracker.model}</p>
+            <h2>Relatório Acumulado</h2>
+            <p><strong>Sessão:</strong> {st.session_state.get('session_id','N/A')}</p>
+            <p><strong>Data:</strong> {timestamp}</p>
+            <p><strong>Provedor/Modelo:</strong> {tracker.provider}/{tracker.model}</p>
             <p><strong>Cargo:</strong> {cargo}</p>
-            <h3>Totais:</h3>
-            <ul>
-                <li>Prompt: {tracker.total_prompt}</li>
-                <li>Completion: {tracker.total_completion}</li>
-                <li>Total Tokens: {tracker.total_tokens}</li>
-                <li>Custo Estimado: ${tracker.cost_usd_gpt():.4f}</li>
-            </ul>
-            <p>--- Elder Brain Analytics ---</p>
+            <p><strong>Total Tokens:</strong> {tracker.total_tokens}</p>
+            <p><strong>Custo:</strong> ${tracker.cost_usd_gpt():.4f}</p>
             """
         else:
             step_data = tracker.steps.get(step, TokenStep())
             body = f"""
             <h2>Uso - {step.upper()}</h2>
             <p><strong>Sessão:</strong> {st.session_state.get('session_id','N/A')}</p>
-            <p><strong>Data/Hora:</strong> {timestamp}</p>
-            <p><strong>Provedor/Modelo:</strong> {tracker.provider} / {tracker.model}</p>
-            <p><strong>Cargo:</strong> {cargo}</p>
-            <p><strong>Tokens neste Step:</strong> {step_data.total} (prompt: {step_data.prompt}, output: {step_data.completion})</p>
-            <p><strong>Custo Total Até Agora:</strong> ${tracker.cost_usd_gpt():.4f}</p>
-            <p>--- Elder Brain Analytics ---</p>
+            <p><strong>Data:</strong> {timestamp}</p>
+            <p><strong>Tokens:</strong> {step_data.total} (prompt: {step_data.prompt}, output: {step_data.completion})</p>
+            <p><strong>Custo Total:</strong> ${tracker.cost_usd_gpt():.4f}</p>
             """
-
         msg.attach(MIMEText(body, 'html'))
-
         server = smtplib.SMTP(smtp_server, port)
         server.starttls()
         server.login(sender, app_password)
@@ -380,7 +328,7 @@ def send_admin_notification(tracker: TokenTracker, step: str, cargo: str, mode: 
 # ======== Core IA ========
 def extract_bfa_data(text: str, cargo: str, training_context: str,
                      provider: str, model_id: str, token: str, tracker: TokenTracker
-                     ) -> Tuple[Optional[Dict], str]:
+                     ) -> Tuple[OptionalOptional[Dict], str]:
     try:
         client = get_llm_client_cached(provider, token)
     except Exception as e:
@@ -432,9 +380,42 @@ def analyze_bfa_data(bfa_data: Dict, cargo: str, perfil_cargo: Dict,
     except Exception as e:
         return None, f"[Erro LLM] {e}"
 
+# ======== Chat/Completion wrappers ========
+def _chat_completion_json(provider, client, model, messages, force_json=True):
+    usage = None
+    if (provider or "").lower() == "groq":
+        kwargs = dict(model=model, messages=messages, max_tokens=MAX_TOKENS_FIXED, temperature=TEMP_FIXED)
+        if force_json:
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = client.chat.completions.create(**kwargs)
+        content = resp.choices[0].message.content.strip()
+        usage = getattr(resp, "usage", None)
+        if usage:
+            usage = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}
+        return content, usage
+    else:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=messages if not force_json else ([{"role":"system","content":"Responda apenas com JSON válido."}] + messages),
+            temperature=TEMP_FIXED,
+            max_tokens=MAX_TOKENS_FIXED,
+            response_format={"type":"json_object"} if force_json else None
+        )
+        content = resp.choices[0].message.content.strip()
+        usage = getattr(resp, "usage", None)
+        if usage:
+            usage = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}
+        return content, usage
+
+def _estimate_and_add(tracker, step, messages, content, usage):
+    if usage:
+        tracker.add(step, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
+        return
+    prompt_text = "\n".join([m.get("content","") for m in messages])
+    tracker.add(step, _estimate_tokens(prompt_text), _estimate_tokens(content))
+
 # ======== GRÁFICOS CORRIGIDOS ========
 def limpar_traits_para_grafico(traits: Dict) -> Dict:
-    """Garante valores 0.0 a 10.0 para todos os traços."""
     limpos = {}
     for k in ["Abertura", "Conscienciosidade", "Extroversão", "Amabilidade", "Neuroticismo"]:
         v = traits.get(k)
@@ -448,21 +429,13 @@ def criar_radar_bfa(traits: Dict, ideais: Dict) -> go.Figure:
     try:
         categories = ["Abertura", "Conscienciosidade", "Extroversão", "Amabilidade", "Neuroticismo"]
         values = [traits.get(cat, 0.0) for cat in categories]
-
-        ideal_min = []
-        ideal_max = []
-        for cat in categories:
-            faixa = ideais.get(cat, (0, 10))
-            min_val = float(faixa[0]) if isinstance(faixa, (list, tuple)) and len(faixa) > 0 else 0
-            max_val = float(faixa[1]) if isinstance(faixa, (list, tuple)) and len(faixa) > 1 else 10
-            ideal_min.append(max(0, min(10, min_val)))
-            ideal_max.append(max(0, min(10, max_val)))
+        ideal_min = [max(0, min(10, ideais.get(cat, (0,10))[0])) for cat in categories]
+        ideal_max = [max(0, min(10, ideais.get(cat, (0,10))[1])) for cat in categories]
 
         fig = go.Figure()
         fig.add_trace(go.Scatterpolar(r=values, theta=categories, fill='toself', name='Candidato', line_color='purple'))
         fig.add_trace(go.Scatterpolar(r=ideal_min, theta=categories, name='Ideal Mín', line=dict(color='green', dash='dash'), mode='lines'))
         fig.add_trace(go.Scatterpolar(r=ideal_max, theta=categories, name='Ideal Máx', line=dict(color='green', dash='dash'), mode='lines'))
-
         fig.update_layout(
             polar=dict(radialaxis=dict(visible=True, range=[0,10], tickvals=[0,2,4,6,8,10])),
             showlegend=True,
@@ -530,25 +503,136 @@ class PDFReport(FPDF):
         self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
 
 def gerar_pdf_corporativo(bfa_data: Dict, analysis: Dict, cargo: str, save_path: str = None, logo_path: str = None) -> io.BytesIO:
-    # ... (mesmo código do PDF anterior, sem alterações) ...
-    # (mantido para brevidade — copie do seu código original)
-    # Retorna io.BytesIO com o PDF gerado
-    # ... (código completo do PDF aqui) ...
+    try:
+        pdf = PDFReport()
+        montserrat_ok = _register_montserrat(pdf)
+        pdf.set_main_family("Montserrat" if montserrat_ok else "Arial", montserrat_ok)
+        pdf.add_page()
+
+        if logo_path and os.path.exists(logo_path):
+            pdf.image(logo_path, x=10, y=8, w=30)
+        pdf.set_font(pdf._family, 'B', 16)
+        pdf.cell(0, 10, pdf._safe('RELATÓRIO DE ANÁLISE COMPORTAMENTAL'), ln=1, align='C')
+        pdf.set_font(pdf._family, '', 12)
+        pdf.cell(0, 10, pdf._safe(f"Cargo: {cargo}"), ln=1, align='C')
+        pdf.ln(5)
+
+        pdf.set_font(pdf._family, 'B', 12)
+        pdf.cell(0, 8, pdf._safe('Resumo Executivo'), ln=1)
+        pdf.set_font(pdf._family, '', 10)
+        pdf.multi_cell(0, 5, pdf._safe(analysis.get('resumo_executivo', '')))
+        pdf.ln(5)
+
+        pdf.set_font(pdf._family, 'B', 12)
+        pdf.cell(0, 8, pdf._safe('Decisão Recomendada'), ln=1)
+        pdf.set_font(pdf._family, '', 10)
+        decisao = analysis.get('decisao', 'N/A')
+        pdf.cell(0, 5, pdf._safe(f"{decisao} - {analysis.get('justificativa_decisao', '')}"), ln=1)
+        pdf.ln(5)
+
+        pdf.set_font(pdf._family, 'B', 12)
+        pdf.cell(0, 8, pdf._safe('Análise dos Traços Big Five'), ln=1)
+        traits = bfa_data.get('traits_bfa', {})
+        for trait, value in traits.items():
+            if value is not None:
+                pdf.set_font(pdf._family, 'B', 10)
+                pdf.cell(0, 6, pdf._safe(f"{trait}: {value:.1f}/10"), ln=1)
+                pdf.set_font(pdf._family, '', 9)
+                pdf.multi_cell(0, 5, pdf._safe(analysis.get('analise_tracos', {}).get(trait, '')))
+        pdf.ln(5)
+
+        pdf.set_font(pdf._family, 'B', 12)
+        pdf.cell(0, 8, pdf._safe('Competências Críticas'), ln=1)
+        for comp in analysis.get('competencias_criticas', []):
+            pdf.set_font(pdf._family, 'B', 10)
+            pdf.cell(0, 6, pdf._safe(f"{comp.get('competencia')}: {comp.get('status')}"), ln=1)
+            pdf.set_font(pdf._family, '', 9)
+            pdf.multi_cell(0, 5, pdf._safe(comp.get('avaliacao', '')))
+        pdf.ln(5)
+
+        pdf.set_font(pdf._family, 'B', 12)
+        pdf.cell(0, 8, pdf._safe('Saúde Emocional'), ln=1)
+        pdf.set_font(pdf._family, '', 10)
+        pdf.multi_cell(0, 5, pdf._safe(analysis.get('saude_emocional_contexto', '')))
+        pdf.ln(5)
+
+        pdf.set_font(pdf._family, 'B', 12)
+        pdf.cell(0, 8, pdf._safe('Recomendações de Desenvolvimento'), ln=1)
+        pdf.set_font(pdf._family, '', 10)
+        for rec in analysis.get('recomendacoes_desenvolvimento', []):
+            pdf.cell(0, 5, pdf._safe(f"- {rec}"), ln=1)
+        pdf.ln(5)
+
+        pdf.set_font(pdf._family, 'B', 12)
+        pdf.cell(0, 8, pdf._safe('Cargos Alternativos'), ln=1)
+        for alt in analysis.get('cargos_alternativos', []):
+            pdf.set_font(pdf._family, 'B', 10)
+            pdf.cell(0, 6, pdf._safe(alt.get('cargo', '')), ln=1)
+            pdf.set_font(pdf._family, '', 9)
+            pdf.multi_cell(0, 5, pdf._safe(alt.get('justificativa', '')))
+
+        pdf.ln(2); pdf.set_font(pdf._family,'I',8)
+        pdf.multi_cell(0,4,pdf._safe("Este relatório auxilia a decisão e não substitui avaliação profissional. Uso interno — Elder Brain Analytics PRO."))
+
+        out_bytes = pdf.output(dest='S')
+        if isinstance(out_bytes, str): out_bytes = out_bytes.encode('latin-1','replace')
+        buf = io.BytesIO(out_bytes); buf.seek(0)
+        if save_path:
+            try:
+                with open(save_path,'wb') as f: f.write(buf.getbuffer())
+            except Exception as e:
+                st.error(f"Erro ao salvar PDF: {e}")
+        return buf
+    except Exception as e:
+        st.error(f"Erro crítico na geração do PDF: {e}")
+        return io.BytesIO(b'%PDF-1.4\n%EOF\n')
 
 # ======== Chat com Elder Brain ========
-# ... (mesmo código do chat anterior) ...
+CHAT_PROMPT = """Você é o Elder Brain, especialista em análise comportamental.
 
-# ======== UI helpers ========
- def kpi_card(title, value, sub=None):
+Dados extraídos: {bfa_data}
+
+Análise: {analysis}
+
+Cargo: {cargo}
+
+Pergunta do usuário: {query}
+
+Responda de forma concisa e profissional."""
+
+def chat_with_elder_brain(query: str, bfa_data: Dict, analysis: Dict, cargo: str,
+                          provider: str, model_id: str, token: str, tracker: TokenTracker) -> str:
+    try:
+        client = get_llm_client_cached(provider, token)
+    except Exception as e:
+        return f"[Erro cliente] {e}"
+
+    prompt = (CHAT_PROMPT
+              .replace("{bfa_data}", json.dumps(bfa_data, ensure_ascii=False))
+              .replace("{analysis}", json.dumps(analysis, ensure_ascii=False))
+              .replace("{cargo}", cargo)
+              .replace("{query}", query))
+
+    try:
+        content, usage = _chat_completion_json(provider, client, model_id.strip(), [{"role": "user", "content": prompt}], False)
+        _estimate_and_add(tracker, "chat", [{"role":"user","content":prompt}], content, usage)
+        return content
+    except Exception as e:
+        return f"[Erro no chat] {e}"
+
+# ======== UI Helper (CORRIGIDO) ========
+def kpi_card(title, value, sub=None):
     st.markdown(
-        f'<div class="kpi-card"><div style="font-weight:700;font-size:1.02rem">{title}</div>'
+        f'<div class="kpi-card">'
+        f'<div style="font-weight:700;font-size:1.02rem">{title}</div>'
         f'<div style="font-size:1.9rem;margin:.2rem 0 .25rem 0">{value}</div>'
-        f'<div class="small">{sub or ""}</div></div>', unsafe_allow_html=True
+        f'<div class="small">{sub or ""}</div>'
+        f'</div>', unsafe_allow_html=True
     )
 
 # ======== APP ========
 def main():
-    st.set_page_config(page_title="EBA — Corporate PROD (Full)", page_icon="brain", layout="wide")
+    st.set_page_config(page_title="EBA — Corporate PROD", page_icon="brain", layout="wide")
     st.markdown(DARK_CSS, unsafe_allow_html=True)
 
     ss = st.session_state
@@ -564,11 +648,9 @@ def main():
     ss.setdefault('session_id', str(uuid.uuid4()))
     ss.setdefault('email_mode', 'cada_uso')
 
-    # ===== Topo
     st.markdown("## Elder Brain Analytics — Corporate (PROD • Full)")
     st.markdown('<span class="badge">PDF Deluxe</span> <span class="badge">Seguro</span> <span class="badge">Gratuito</span>', unsafe_allow_html=True)
 
-    # ===== Sidebar
     with st.sidebar:
         st.header("Configuração")
         provider = st.radio("Provedor", ["Groq","OpenAI"], index=0, key="provider")
@@ -601,7 +683,6 @@ def main():
             st.write(f"**Total:** {ss['tracker'].total_tokens} tokens")
             st.write(f"**Custo:** ${ss['tracker'].cost_usd_gpt():.4f}")
 
-    # ===== KPIs
     c1,c2,c3,c4 = st.columns(4)
     with c1: kpi_card("Status", "Pronto", "Aguardando PDF")
     if ss['admin_mode']:
@@ -613,7 +694,6 @@ def main():
         with c3: kpi_card("Andamento", "—", "")
         with c4: kpi_card("Online", "Sim", "")
 
-    # ===== Upload & Processamento
     st.markdown("### Upload do Relatório BFA")
     uploaded_file = st.file_uploader("PDF do BFA", type=["pdf"])
 
@@ -659,7 +739,6 @@ def main():
             ss['bfa_data'], ss['analysis'], ss['analysis_complete'] = bfa_data, analysis, True
             st.success("Análise concluída!"); st.rerun()
 
-    # ===== Resultados
     if ss.get('analysis_complete'):
         st.markdown("## Resultados")
         decisao = ss['analysis'].get('decisao','N/A')
@@ -684,11 +763,60 @@ def main():
 
             df_traits = pd.DataFrame([
                 {'Traço': k, 'Valor': f"{traits.get(k,0):.1f}/10", 'Ideal': f"{perfil_ideal.get(k,(0,10))[0]}-{perfil_ideal.get(k,(0,10))[1]}"}
-                for k in categories
+                for k in ["Abertura", "Conscienciosidade", "Extroversão", "Amabilidade", "Neuroticismo"]
             ])
             st.dataframe(df_traits, use_container_width=True, hide_index=True)
 
-        # ... (demais abas mantidas, com gráficos corrigidos) ...
+            st.markdown("##### Análise Detalhada")
+            for trait, txt in (ss['analysis'].get('analise_tracos',{}) or {}).items():
+                with st.expander(f"**{trait}**"):
+                    st.write(txt)
+
+        with tab2:
+            comps = ss['bfa_data'].get('competencias_ms',[])
+            figc = criar_grafico_competencias(comps)
+            if figc: st.plotly_chart(figc, use_container_width=True)
+            st.markdown("##### Competências Críticas")
+            for comp in ss['analysis'].get('competencias_criticas',[]):
+                status = comp.get('status'); compn = comp.get('competencia'); txt = comp.get('avaliacao','')
+                if status == 'ATENDE': st.success(f"OK {compn} — {status}"); st.caption(txt)
+                elif status == 'PARCIAL': st.warning(f"Warning {compn} — {status}"); st.caption(txt)
+                else: st.error(f"Error {compn} — {status}"); st.caption(txt)
+            if comps:
+                with st.expander("Ver todas"):
+                    df_comp = pd.DataFrame(comps).sort_values('nota', ascending=False)
+                    st.dataframe(df_comp, use_container_width=True, hide_index=True)
+
+        with tab3:
+            st.subheader("Saúde Emocional")
+            st.write(ss['analysis'].get('saude_emocional_contexto',''))
+            indicadores = ss['bfa_data'].get('indicadores_saude_emocional',{})
+            if any(v is not None for v in indicadores.values()):
+                cols = st.columns(2)
+                for i,(k,v) in enumerate(indicadores.items()):
+                    if v is None: continue
+                    with cols[i%2]: st.metric(k.replace('_',' ').title(), f"{float(v):.0f}")
+
+        with tab4:
+            st.subheader("Desenvolvimento")
+            for i,r in enumerate(ss['analysis'].get('recomendacoes_desenvolvimento',[]),1):
+                st.markdown(f"**{i}.** {r}")
+            pf = ss['bfa_data'].get('pontos_fortes',[])
+            if pf:
+                st.markdown("##### Pontos Fortes")
+                for x in pf: st.success(f"• {x}")
+            pa = ss['bfa_data'].get('pontos_atencao',[])
+            if pa:
+                st.markdown("##### Pontos de Atenção")
+                for x in pa: st.warning(f"• {x}")
+
+        with tab5:
+            c1,c2 = st.columns(2)
+            with c1: st.json(ss['bfa_data'])
+            with c2: st.json(ss['analysis'])
+
+        st.markdown("### Compatibilidade")
+        st.plotly_chart(criar_gauge_fit(compat), use_container_width=True)
 
         st.markdown("### Gerar PDF")
         logo_path = st.text_input("Logo (opcional)", "")
@@ -706,7 +834,7 @@ def main():
         if ss.get('pdf_generated'):
             st.download_button("Download PDF", data=ss['pdf_generated']['buffer'].getvalue(), file_name=ss['pdf_generated']['filename'], mime="application/pdf")
 
-        st.markdown("### Chat")
+        st.markdown("### Chat com Elder Brain")
         q = st.text_input("Pergunte")
         if q and st.button("Enviar"):
             with st.spinner("Pensando..."):
