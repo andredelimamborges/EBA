@@ -1,196 +1,80 @@
-# elder_brain_v8_5_pro_prod_full_corrigido.py
+# elder_brain_v8_5_pro.py
 """
-Elder Brain Analytics — PRO (Full) • PROD
-- Extração + Análise + Gráficos + PDF Deluxe + Chat + Treinamento
-- API keys via st.secrets
-- Painel Admin com senha
-- Notificações por e-mail (Gmail gratuito)
-- GRÁFICOS 100% CORRIGIDOS (sem PlotlyError)
-- INDENTAÇÃO CORRIGIDA (sem IndentationError)
-Autor: André de Lima | 2025-11-04
+Elder Brain Analytics — PRO (UI Corporativa • sem Chat/Preview/Treinamento)
+- Melhorias gráficas e layout corporativo
+- Removido Chat com IA
+- Removido Preview de texto
+- Removido upload de materiais de treinamento
+- Adicionado 'Como funciona'
+- Status realmente funcional (pipeline)
 """
 
-import os, io, re, json, time, smtplib
+import os
+import io
+import re
+import json
+import time
 from datetime import datetime
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.colors import qualitative
 from fpdf import FPDF
+import requests
+
 from pdfminer.high_level import extract_text
 import streamlit as st
-import httpx
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-import uuid
+from groq import Groq
 
-# ======== LLM Clients ========
-try:
-    from groq import Groq
-except Exception:
-    Groq = None
+# =============================================================================
+# CONFIG & CONSTANTES
+# =============================================================================
 
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+APP_NAME = "Elder Brain Analytics — PRO"
+APP_TAGLINE = "Análise profissional de relatórios BFA para RH"
+PALETA = {
+    "prim": "#2C109C",      # Roxo corporativo
+    "prim_alt": "#4A30C4",
+    "dark": "#1E1E2A",
+    "bg": "#0e1117",
+    "card": "#111827",
+    "ok": "#2ECC71",
+    "warn": "#F39C12",
+    "err": "#E74C3C",
+    "muted": "#94a3b8"
+}
 
-# ======== Token helpers ========
-try:
-    import tiktoken
-except Exception:
-    tiktoken = None
-
-# ======== Diretórios / Constantes ========
-TRAINING_DIR = "training_data"
+TRAINING_DIR = "training_data"          # mantido, mas não exposto no UI
 PROCESSED_DIR = "relatorios_processados"
 os.makedirs(TRAINING_DIR, exist_ok=True)
 os.makedirs(PROCESSED_DIR, exist_ok=True)
 
-MODELOS_SUGERIDOS_GROQ = [
-    "llama-3.1-8b-instant", "llama-3.1-70b-versatile", "mixtral-8x7b-32768",
-    "gemma2-9b-it", "llama-3.2-1b-preview", "llama-3.2-3b-preview"
+# Sugeridos (campo é livre, mas ajudamos)
+MODELOS_SUGERIDOS = [
+    "llama-3.1-8b-instant",
+    "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+    "llama-3.2-1b-preview",
+    "llama-3.2-3b-preview",
 ]
-MODELOS_SUGERIDOS_OPENAI = ["gpt-4o-mini", "gpt-4o"]
 
-MAX_TOKENS_FIXED = 4096
-TEMP_FIXED = 0.3
-GPT_PRICE_INPUT_PER_1K = 0.005
-GPT_PRICE_OUTPUT_PER_1K = 0.015
+# =============================================================================
+# PROMPTS
+# =============================================================================
 
-# ======== Tema CSS ========
-DARK_CSS = """
-<style>
-:root{
-  --bg:#20152b; --panel:#2a1f39; --panel-2:#332447; --accent:#9b6bff;
-  --text:#EAE6F5; --muted:#B9A8D9; --success:#2ECC71; --warn:#F39C12; --danger:#E74C3C;
-}
-html, body, .stApp { background: var(--bg); color: var(--text) !important; }
-section[data-testid="stSidebar"] { background: #1b1c25; border-right: 1px solid #3b3d4b; }
-header[data-testid="stHeader"] { display:none !important; }
-.kpi-card{background:var(--panel); border:1px solid #3f4151; border-radius:14px; padding:14px; box-shadow:0 8px 24px rgba(0,0,0,.22)}
-.small{color:var(--muted);font-size:.9rem}
-.badge{display:inline-block;background:#2a2b36;color:var(--muted);padding:.25rem .55rem;border-radius:999px;border:1px solid #3f4151;margin-right:.35rem}
-.stButton>button,.stDownloadButton>button{background:linear-gradient(135deg,var(--accent),#7c69d4); color:white; border:0; padding:.55rem 1rem; border-radius:12px; font-weight:700; box-shadow:0 10px 22px rgba(96,81,155,.25)}
-.stButton>button:hover,.stDownloadButton>button:hover{filter:brightness(1.06)}
-</style>
-"""
-
-# ======== Fontes PDF ========
-def _download_font(dst: str, url: str) -> bool:
-    try:
-        import requests
-        r = requests.get(url, timeout=15)
-        if r.ok:
-            with open(dst, "wb") as f:
-                f.write(r.content)
-            return True
-    except Exception:
-        pass
-    return False
-
-def _register_montserrat(pdf: FPDF) -> bool:
-    os.makedirs("fonts", exist_ok=True)
-    font_map = {
-        "Montserrat-Regular.ttf": "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Regular.ttf",
-        "Montserrat-Bold.ttf": "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Bold.ttf",
-        "Montserrat-Italic.ttf": "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Italic.ttf",
-    }
-    ok = True
-    for fname, url in font_map.items():
-        path = os.path.join("fonts", fname)
-        if not os.path.exists(path):
-            if not _download_font(path, url):
-                ok = False
-    if not ok:
-        return False
-    try:
-        pdf.add_font("Montserrat", "", os.path.join("fonts", "Montserrat-Regular.ttf"), uni=True)
-        pdf.add_font("Montserrat", "B", os.path.join("fonts", "Montserrat-Bold.ttf"), uni=True)
-        pdf.add_font("Montserrat", "I", os.path.join("fonts", "Montserrat-Italic.ttf"), uni=True)
-        return True
-    except Exception:
-        return False
-
-# ======== Token Accounting ========
-@dataclass
-class TokenStep:
-    prompt: int = 0
-    completion: int = 0
-    @property
-    def total(self): return self.prompt + self.completion
-
-@dataclass
-class TokenTracker:
-    steps: Dict[str, TokenStep] = field(default_factory=lambda: {
-        "extracao": TokenStep(), "analise": TokenStep(), "chat": TokenStep(), "pdf": TokenStep()
-    })
-    model: str = ""
-    provider: str = ""
-
-    def add(self, step: str, prompt_tokens: int, completion_tokens: int):
-        if step not in self.steps:
-            self.steps[step] = TokenStep()
-        self.steps[step].prompt += int(prompt_tokens or 0)
-        self.steps[step].completion += int(completion_tokens or 0)
-
-    def dict(self):
-        return {k: {"prompt": v.prompt, "completion": v.completion, "total": v.total} for k, v in self.steps.items()}
-
-    @property
-    def total_prompt(self): return sum(s.prompt for s in self.steps.values())
-    @property
-    def total_completion(self): return sum(s.completion for s in self.steps.values())
-    @property
-    def total_tokens(self): return self.total_prompt + self.total_completion
-
-    def cost_usd_gpt(self) -> float:
-        return (self.total_prompt/1000.0)*GPT_PRICE_INPUT_PER_1K + (self.total_completion/1000.0)*GPT_PRICE_OUTPUT_PER_1K
-
-def _estimate_tokens(text: str) -> int:
-    if not text: return 0
-    try:
-        if tiktoken:
-            enc = tiktoken.get_encoding("cl100k_base")
-            return len(enc.encode(text))
-    except Exception:
-        pass
-    return max(1, int(len(text) / 4))
-
-# ======== Cliente LLM seguro ========
-@st.cache_resource(show_spinner=False)
-def get_llm_client_cached(provider: str, api_key: str):
-    if not api_key:
-        raise RuntimeError("Chave da API não configurada nos Secrets.")
-    pv = (provider or "Groq").lower()
-    if pv == "groq":
-        try:
-            from groq import Groq
-            client = Groq(api_key=api_key, http_client=httpx.Client(proxies=None))
-            os.environ.pop("HTTP_PROXY", None); os.environ.pop("HTTPS_PROXY", None)
-            return client
-        except Exception as e:
-            raise RuntimeError(f"[Erro cliente] Groq SDK falhou ({e})")
-    elif pv == "openai":
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=api_key, http_client=httpx.Client(proxies=None))
-            os.environ.pop("HTTP_PROXY", None); os.environ.pop("HTTPS_PROXY", None)
-            return client
-        except Exception as e:
-            raise RuntimeError(f"[Erro cliente] OpenAI SDK falhou ({e})")
-    else:
-        raise RuntimeError(f"Provedor não suportado: {provider}")
-
-# ======== Prompts =========
 EXTRACTION_PROMPT = """Você é um especialista em análise de relatórios BFA (Big Five Analysis) para seleção de talentos.
+
 Sua tarefa: extrair dados do relatório abaixo e retornar APENAS um JSON válido, sem texto adicional.
 
 ESTRUTURA OBRIGATÓRIA:
 {
-  "candidato": {"nome": "string ou null","cargo_avaliado": "string ou null"},
+  "candidato": {
+    "nome": "string ou null",
+    "cargo_avaliado": "string ou null"
+  },
   "traits_bfa": {
     "Abertura": número 0-10 ou null,
     "Conscienciosidade": número 0-10 ou null,
@@ -198,649 +82,785 @@ ESTRUTURA OBRIGATÓRIA:
     "Amabilidade": número 0-10 ou null,
     "Neuroticismo": número 0-10 ou null
   },
-  "competencias_ms": [{"nome": "string","nota": número,"classificacao": "string"}],
-  "facetas_relevantes": [{"nome": "string","percentil": número,"interpretacao": "string resumida"}],
-  "indicadores_saude_emocional": {"ansiedade": 0-100 ou null,"irritabilidade": 0-100 ou null,"estado_animo": 0-100 ou null,"impulsividade": 0-100 ou null},
+  "competencias_ms": [
+    {"nome": "string", "nota": número, "classificacao": "string"}
+  ],
+  "facetas_relevantes": [
+    {"nome": "string", "percentil": número, "interpretacao": "string resumida"}
+  ],
+  "indicadores_saude_emocional": {
+    "ansiedade": número 0-100 ou null,
+    "irritabilidade": número 0-100 ou null,
+    "estado_animo": número 0-100 ou null,
+    "impulsividade": número 0-100 ou null
+  },
   "potencial_lideranca": "BAIXO" | "MÉDIO" | "ALTO" ou null,
-  "integridade_fgi": 0-100 ou null,
-  "resumo_qualitativo": "texto original do relatório",
-  "pontos_fortes": ["3-5 itens"],
-  "pontos_atencao": ["2-4 itens"],
-  "fit_geral_cargo": 0-100
+  "integridade_fgi": número 0-100 ou null,
+  "resumo_qualitativo": "texto do resumo presente no relatório",
+  "pontos_fortes": ["lista de 3-5 pontos"],
+  "pontos_atencao": ["lista de 2-4 pontos"],
+  "fit_geral_cargo": número 0-100
 }
 
 REGRAS:
-1) Normalize percentis para escalas; 2) Big Five: percentil 60 -> 6.0/10; 3) Extraia TODAS as competências;
-4) Use null quando não houver evidência; 5) resumo_qualitativo = texto original;
-6) pontos_fortes (3-5) e pontos_atencao (2-4); 7) fit_geral_cargo 0-100 baseado no cargo: {cargo}.
+1) Converta percentis Big Five para 0-10 quando necessário (ex.: 60 -> 6.0).
+2) Extraia TODAS as competências mencionadas.
+3) Use null quando não houver dado confiável.
+4) 'resumo_qualitativo' é o trecho original do relatório.
+5) 'fit_geral_cargo' (0-100) baseado no cargo: {cargo}.
 
-RELATÓRIO:
+RELATÓRIO (texto):
 \"\"\"{text}\"\"\"
 
-MATERIAIS (opcional):
-\"\"\"{training_context}\"\"\"
-
-Retorne apenas o JSON puro.
+Retorne APENAS o JSON, sem markdown, sem explicações.
 """
 
-ANALYSIS_PROMPT = """Você é um consultor sênior de RH especializado em análise comportamental.
+ANALYSIS_PROMPT = """Você é um consultor sênior de RH especializado em análise comportamental e fit cultural.
 
-Cargo avaliado: {cargo}
+Baseado nos dados extraídos do BFA, faça uma análise profissional para o cargo: {cargo}
 
-DADOS (JSON extraído):
+DADOS DO CANDIDATO:
 {json_data}
 
-PERFIL IDEAL DO CARGO:
+PERFIL IDEAL (gerado dinamicamente):
 {perfil_cargo}
 
-Responda em JSON:
+Retorne **apenas JSON**:
 {
-  "compatibilidade_geral": 0-100,
+  "compatibilidade_geral": número 0-100,
   "decisao": "RECOMENDADO" | "RECOMENDADO COM RESSALVAS" | "NÃO RECOMENDADO",
-  "justificativa_decisao": "texto",
+  "justificativa_decisao": "parágrafo explicativo",
   "analise_tracos": {
-    "Abertura": "texto","Conscienciosidade": "texto","Extroversao": "texto","Amabilidade": "texto","Neuroticismo": "texto"
+    "Abertura": "texto",
+    "Conscienciosidade": "texto",
+    "Extroversao": "texto",
+    "Amabilidade": "texto",
+    "Neuroticismo": "texto"
   },
-  "competencias_criticas": [{"competencia":"nome","avaliacao":"texto","status":"ATENDE" | "PARCIAL" | "NÃO ATENDE"}],
-  "saude_emocional_contexto": "texto",
-  "recomendacoes_desenvolvimento": ["a","b","c"],
-  "cargos_alternativos": [{"cargo":"nome","justificativa":"texto"}],
+  "competencias_criticas": [
+    {"competencia": "nome", "avaliacao": "texto", "status": "ATENDE" | "PARCIAL" | "NÃO ATENDE"}
+  ],
+  "saude_emocional_contexto": "parágrafo",
+  "recomendacoes_desenvolvimento": ["itens..."],
+  "cargos_alternativos": [{"cargo": "nome", "justificativa": "texto"}],
   "resumo_executivo": "100-150 palavras"
-}"""
+}
+"""
 
-# ======== Helpers I/O ========
+# =============================================================================
+# FONTE & PDF
+# =============================================================================
+
+def _register_montserrat(pdf: FPDF):
+    os.makedirs("fonts", exist_ok=True)
+    urls = {
+        "Montserrat-Regular.ttf": "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Regular.ttf",
+        "Montserrat-Bold.ttf": "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat-Bold.ttf",
+    }
+    for fname, url in urls.items():
+        fp = os.path.join("fonts", fname)
+        if not os.path.exists(fp):
+            try:
+                r = requests.get(url, timeout=12)
+                if r.ok:
+                    with open(fp, "wb") as f:
+                        f.write(r.content)
+            except Exception:
+                pass
+    try:
+        pdf.add_font("Montserrat", "", os.path.join("fonts", "Montserrat-Regular.ttf"), uni=True)
+        pdf.add_font("Montserrat", "B", os.path.join("fonts", "Montserrat-Bold.ttf"), uni=True)
+    except Exception:
+        pass
+
+class PDFReport(FPDF):
+    def header(self):
+        self.set_font('Montserrat', 'B', 14)
+        self.set_text_color(20, 20, 20)
+        self.cell(0, 8, 'RELATÓRIO DE ANÁLISE COMPORTAMENTAL — EBA PRO', 0, 1, 'C')
+        self.set_font('Montserrat', '', 9)
+        self.set_text_color(90, 90, 90)
+        self.cell(0, 5, datetime.now().strftime('%d/%m/%Y %H:%M'), 0, 1, 'C')
+        self.ln(2)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Montserrat', '', 8)
+        self.set_text_color(120, 120, 120)
+        self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
+
+    def chapter_title(self, title):
+        self.set_fill_color(44, 16, 156)  # roxo corporativo
+        self.set_text_color(255, 255, 255)
+        self.set_font('Montserrat', 'B', 11)
+        self.cell(0, 9, f" {title}", 0, 1, 'L', True)
+        self.set_text_color(0, 0, 0)
+        self.ln(1)
+
+    def chapter_body(self, body):
+        self.set_font('Arial', '', 10)
+        self.multi_cell(0, 5, body)
+        self.ln(1)
+
+def gerar_pdf_profissional(bfa_data: Dict, analysis: Dict, cargo: str, save_path: str = None) -> io.BytesIO:
+    try:
+        pdf = PDFReport()
+        _register_montserrat(pdf)
+        pdf.add_page()
+
+        # 1. CANDIDATO
+        pdf.chapter_title('1. INFORMACOES DO CANDIDATO')
+        cand = bfa_data.get('candidato', {}) or {}
+        info = f"Nome: {cand.get('nome', 'Nao informado')}\nCargo Avaliado: {cargo}\nData da Análise: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        pdf.chapter_body(info)
+
+        # 2. DECISÃO
+        pdf.chapter_title('2. DECISAO E COMPATIBILIDADE')
+        decisao = analysis.get('decisao', 'N/A')
+        compat = float(analysis.get('compatibilidade_geral', 0) or 0)
+        blocos = {
+            'RECOMENDADO': (46, 204, 113),
+            'RECOMENDADO COM RESSALVAS': (241, 196, 15),
+            'NÃO RECOMENDADO': (231, 76, 60)
+        }
+        r, g, b = blocos.get(decisao, (150, 150, 150))
+        pdf.set_fill_color(r, g, b)
+        pdf.set_font('Montserrat', 'B', 13)
+        pdf.set_text_color(255, 255, 255)
+        pdf.cell(0, 10, f'  {decisao}  ', 0, 1, 'C', True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font('Montserrat', 'B', 11)
+        pdf.cell(0, 7, f'Compatibilidade: {compat:.0f}%', 0, 1, 'C')
+        just = analysis.get('justificativa_decisao', '')
+        if just:
+            pdf.chapter_body(just)
+
+        # 3. RESUMO EXECUTIVO
+        pdf.chapter_title('3. RESUMO EXECUTIVO')
+        resumo = analysis.get('resumo_executivo') or analysis.get('justificativa_decisao', '')
+        if resumo:
+            pdf.chapter_body(resumo)
+
+        # 4. BIG FIVE
+        pdf.chapter_title('4. TRACOS DE PERSONALIDADE (BIG FIVE)')
+        traits = bfa_data.get('traits_bfa', {}) or {}
+        for k, v in traits.items():
+            if v is not None:
+                pdf.set_font('Montserrat', 'B', 10)
+                pdf.cell(60, 6, f'{k}:', 0, 0)
+                pdf.set_font('Arial', '', 10)
+                pdf.cell(0, 6, f'{float(v):.1f}/10', 0, 1)
+        pdf.ln(1)
+        a_tracos = analysis.get('analise_tracos', {}) or {}
+        for k, txt in a_tracos.items():
+            if txt:
+                pdf.set_font('Montserrat', '', 9)
+                pdf.multi_cell(0, 5, f'{k}: {txt}')
+        pdf.ln(1)
+
+        # 5. COMPETÊNCIAS CRÍTICAS
+        pdf.chapter_title('5. COMPETENCIAS CRITICAS')
+        comp_crit = analysis.get('competencias_criticas', []) or []
+        for c in comp_crit:
+            status = c.get('status', '')
+            simbolo = 'OK' if status == 'ATENDE' else ('PARC' if status == 'PARCIAL' else 'NAO')
+            pdf.set_font('Montserrat', 'B', 10)
+            pdf.cell(0, 6, f"[{simbolo}] {c.get('competencia','')}: {status}", 0, 1)
+            if c.get('avaliacao'):
+                pdf.set_font('Arial', '', 9)
+                pdf.multi_cell(0, 5, "   " + c['avaliacao'])
+                pdf.ln(0.5)
+
+        # 6. SAÚDE EMOCIONAL
+        pdf.chapter_title('6. SAUDE EMOCIONAL E RESILIENCIA')
+        ctx = analysis.get('saude_emocional_contexto', '')
+        if ctx:
+            pdf.chapter_body(ctx)
+        ind = bfa_data.get('indicadores_saude_emocional', {}) or {}
+        for nome, valor in ind.items():
+            if valor is not None:
+                pdf.set_font('Arial', '', 9)
+                pdf.cell(70, 5, f'{nome.replace("_"," ").title()}:', 0, 0)
+                pdf.cell(0, 5, f'{float(valor):.0f}/100', 0, 1)
+        pdf.ln(1)
+
+        # 7. PONTOS
+        pf = bfa_data.get('pontos_fortes', []) or []
+        if pf:
+            pdf.chapter_title('7. PONTOS FORTES')
+            for t in pf:
+                pdf.set_font('Arial', '', 10)
+                pdf.multi_cell(0, 5, f'+ {t}')
+        pa = bfa_data.get('pontos_atencao', []) or []
+        if pa:
+            pdf.chapter_title('8. PONTOS DE ATENCAO')
+            for t in pa:
+                pdf.set_font('Arial', '', 10)
+                pdf.multi_cell(0, 5, f'! {t}')
+
+        # 8. RECOMENDAÇÕES
+        pdf.add_page()
+        pdf.chapter_title('9. RECOMENDACOES DE DESENVOLVIMENTO')
+        recs = analysis.get('recomendacoes_desenvolvimento', []) or []
+        for i, rtxt in enumerate(recs, 1):
+            pdf.set_font('Montserrat', 'B', 10)
+            pdf.cell(10, 6, f'{i}.', 0, 0)
+            pdf.set_font('Arial', '', 10)
+            pdf.multi_cell(0, 6, rtxt)
+            pdf.ln(0.5)
+
+        # 9. CARGOS ALTERNATIVOS
+        alt = analysis.get('cargos_alternativos', []) or []
+        if alt:
+            pdf.chapter_title('10. CARGOS ALTERNATIVOS')
+            for c in alt:
+                nome = c.get('cargo', '')
+                j = c.get('justificativa', '')
+                if nome:
+                    pdf.set_font('Montserrat', 'B', 10)
+                    pdf.cell(0, 6, f"- {nome}", 0, 1)
+                    if j:
+                        pdf.set_font('Arial', '', 9)
+                        pdf.multi_cell(0, 5, "   " + j)
+                        pdf.ln(0.5)
+
+        # Saída
+        out = pdf.output(dest='S')
+        if out is None:
+            raise ValueError("PDF output None")
+        pdf_bytes = out.encode('latin1', 'replace') if isinstance(out, str) else out
+
+        bio = io.BytesIO(pdf_bytes)
+        bio.seek(0)
+        if save_path:
+            with open(save_path, "wb") as f:
+                f.write(pdf_bytes)
+        return bio
+    except Exception as e:
+        st.error(f"Erro crítico na geração do PDF: {e}")
+        return io.BytesIO(b'')
+
+# =============================================================================
+# AUXILIARES DE IA & VISUALIZAÇÃO
+# =============================================================================
+
+@st.cache_resource(show_spinner=False)
+def get_groq_client_cached(token: str):
+    if not token:
+        raise RuntimeError("Informe a Groq API Key")
+    try:
+        return Groq(api_key=token)
+    except Exception as e:
+        raise RuntimeError(f"Erro ao criar cliente Groq: {e}")
+
 def extract_pdf_text_bytes(file) -> str:
     try:
         return extract_text(file)
     except Exception as e:
-        return f"[ERRO_EXTRACAO_PDF] {e}"
-
-def load_all_training_texts() -> str:
-    texts = []
-    for fname in sorted(os.listdir(TRAINING_DIR)):
-        path = os.path.join(TRAINING_DIR, fname)
-        try:
-            if fname.lower().endswith(".pdf"):
-                with open(path, "rb") as f:
-                    txt = extract_text(f)
-            else:
-                with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                    txt = f.read()
-            texts.append(f"--- {fname} ---\n{txt[:2000]}\n")
-        except Exception:
-            continue
-    return "\n".join(texts)
+        return f"[ERRO_EXTRACAO_PDF] {str(e)}"
 
 def gerar_perfil_cargo_dinamico(cargo: str) -> Dict:
     return {
         "traits_ideais": {
-            "Abertura": (5,8), "Conscienciosidade": (6,9), "Extroversão": (4,8),
-            "Amabilidade": (5,8), "Neuroticismo": (0,5)
+            "Abertura": (5, 8),
+            "Conscienciosidade": (6, 9),
+            "Extroversao": (4, 8),
+            "Amabilidade": (5, 8),
+            "Neuroticismo": (0, 5)
         },
-        "competencias_criticas": ["Adaptabilidade","Comunicação","Trabalho em Equipe","Resolução de Problemas"],
-        "descricao": f"Perfil para {cargo}"
+        "competencias_criticas": ["Adaptabilidade", "Comunicação", "Trabalho em Equipe", "Resolução de Problemas"],
+        "descricao": f"Perfil profissional adequado para {cargo}."
     }
 
-# ======== Email Admin ========
-def send_admin_notification(tracker: TokenTracker, step: str, cargo: str, mode: str = "cada_uso"):
-    admin_email = st.secrets.get("ADMIN_EMAIL", "")
-    app_password = st.secrets.get("ADMIN_APP_PASSWORD", "")
-    if not admin_email or not app_password:
-        return
-    try:
-        smtp_server = "smtp.gmail.com"
-        port = 587
-        sender = receiver = admin_email
-        msg = MIMEMultipart()
-        msg['From'] = sender
-        msg['To'] = receiver
-        msg['Subject'] = f"Elder Brain: Uso - {step.upper()} (Sessão: {st.session_state.get('session_id','N/A')})"
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def extract_bfa_data(text: str, cargo: str, model_id: str, token: str, temperature: float, max_tokens: int) -> Tuple[Optional[Dict], str]:
+    if not token:
+        return None, "Groq API Key não informada"
+    if not model_id.strip():
+        return None, "Modelo não informado"
 
-        if mode == "soma":
-            body = f"""
-            <h2>Relatório Acumulado</h2>
-            <p><strong>Sessão:</strong> {st.session_state.get('session_id','N/A')}</p>
-            <p><strong>Data:</strong> {timestamp}</p>
-            <p><strong>Provedor/Modelo:</strong> {tracker.provider}/{tracker.model}</p>
-            <p><strong>Cargo:</strong> {cargo}</p>
-            <p><strong>Total Tokens:</strong> {tracker.total_tokens}</p>
-            <p><strong>Custo:</strong> ${tracker.cost_usd_gpt():.4f}</p>
-            """
-        else:
-            step_data = tracker.steps.get(step, TokenStep())
-            body = f"""
-            <h2>Uso - {step.upper()}</h2>
-            <p><strong>Sessão:</strong> {st.session_state.get('session_id','N/A')}</p>
-            <p><strong>Data:</strong> {timestamp}</p>
-            <p><strong>Tokens:</strong> {step_data.total} (prompt: {step_data.prompt}, output: {step_data.completion})</p>
-            <p><strong>Custo Total:</strong> ${tracker.cost_usd_gpt():.4f}</p>
-            """
-        msg.attach(MIMEText(body, 'html'))
-        server = smtplib.SMTP(smtp_server, port)
-        server.starttls()
-        server.login(sender, app_password)
-        server.sendmail(sender, receiver, msg.as_string())
-        server.quit()
-    except Exception as e:
-        print(f"[Email] Erro: {e}")
-
-# ======== Core IA ========
-def extract_bfa_data(text: str, cargo: str, training_context: str,
-                     provider: str, model_id: str, token: str, tracker: TokenTracker
-                     ) -> Tuple[OptionalOptional[Dict], str]:
     try:
-        client = get_llm_client_cached(provider, token)
+        client = get_groq_client_cached(token)
     except Exception as e:
         return None, f"[Erro cliente] {e}"
 
-    prompt = (EXTRACTION_PROMPT
-              .replace("{text}", text[:10000])
-              .replace("{training_context}", training_context[:3000])
-              .replace("{cargo}", cargo))
-
+    prompt = EXTRACTION_PROMPT.format(text=text[:10000], cargo=cargo)
     try:
-        content, usage = _chat_completion_json(provider, client, model_id.strip(), [{"role": "user", "content": prompt}], True)
-        _estimate_and_add(tracker, "extracao", [{"role":"user","content":prompt}], content, usage)
-
-        try:
-            return json.loads(content), content
-        except Exception:
-            m = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', content, re.DOTALL)
-            if m:
-                return json.loads(m.group(0)), content
-            return None, f"Nenhum JSON válido: {content[:800]}..."
-    except Exception as e:
-        return None, f"[Erro LLM] {e}"
-
-def analyze_bfa_data(bfa_data: Dict, cargo: str, perfil_cargo: Dict,
-                     provider: str, model_id: str, token: str, tracker: TokenTracker
-                     ) -> Tuple[Optional[Dict], str]:
-    try:
-        client = get_llm_client_cached(provider, token)
-    except Exception as e:
-        return None, f"[Erro cliente] {e}"
-
-    prompt = (ANALYSIS_PROMPT
-              .replace("{cargo}", cargo)
-              .replace("{json_data}", json.dumps(bfa_data, ensure_ascii=False, indent=2))
-              .replace("{perfil_cargo}", json.dumps(perfil_cargo, ensure_ascii=False, indent=2)))
-
-    try:
-        content, usage = _chat_completion_json(provider, client, model_id.strip(), [{"role": "user", "content": prompt}], True)
-        _estimate_and_add(tracker, "analise", [{"role":"user","content":prompt}], content, usage)
-
-        try:
-            return json.loads(content), content
-        except Exception:
-            m = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', content, re.DOTALL)
-            if m:
-                return json.loads(m.group(0)), content
-            return None, f"Nenhum JSON válido: {content[:800]}..."
-    except Exception as e:
-        return None, f"[Erro LLM] {e}"
-
-# ======== Chat/Completion wrappers ========
-def _chat_completion_json(provider, client, model, messages, force_json=True):
-    usage = None
-    if (provider or "").lower() == "groq":
-        kwargs = dict(model=model, messages=messages, max_tokens=MAX_TOKENS_FIXED, temperature=TEMP_FIXED)
-        if force_json:
-            kwargs["response_format"] = {"type": "json_object"}
-        resp = client.chat.completions.create(**kwargs)
-        content = resp.choices[0].message.content.strip()
-        usage = getattr(resp, "usage", None)
-        if usage:
-            usage = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}
-        return content, usage
-    else:
         resp = client.chat.completions.create(
-            model=model,
-            messages=messages if not force_json else ([{"role":"system","content":"Responda apenas com JSON válido."}] + messages),
-            temperature=TEMP_FIXED,
-            max_tokens=MAX_TOKENS_FIXED,
-            response_format={"type":"json_object"} if force_json else None
+            response_format={"type": "json_object"},
+            model=model_id.strip(),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=int(max_tokens),
+            temperature=float(temperature),
         )
-        content = resp.choices[0].message.content.strip()
-        usage = getattr(resp, "usage", None)
-        if usage:
-            usage = {"prompt_tokens": usage.prompt_tokens, "completion_tokens": usage.completion_tokens}
-        return content, usage
+        raw = resp.choices[0].message.content.strip()
 
-def _estimate_and_add(tracker, step, messages, content, usage):
-    if usage:
-        tracker.add(step, usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
-        return
-    prompt_text = "\n".join([m.get("content","") for m in messages])
-    tracker.add(step, _estimate_tokens(prompt_text), _estimate_tokens(content))
-
-# ======== GRÁFICOS CORRIGIDOS ========
-def limpar_traits_para_grafico(traits: Dict) -> Dict:
-    limpos = {}
-    for k in ["Abertura", "Conscienciosidade", "Extroversão", "Amabilidade", "Neuroticismo"]:
-        v = traits.get(k)
-        if v is None or not isinstance(v, (int, float)):
-            limpos[k] = 0.0
-        else:
-            limpos[k] = max(0.0, min(10.0, float(v)))
-    return limpos
-
-def criar_radar_bfa(traits: Dict, ideais: Dict) -> go.Figure:
-    try:
-        categories = ["Abertura", "Conscienciosidade", "Extroversão", "Amabilidade", "Neuroticismo"]
-        values = [traits.get(cat, 0.0) for cat in categories]
-        ideal_min = [max(0, min(10, ideais.get(cat, (0,10))[0])) for cat in categories]
-        ideal_max = [max(0, min(10, ideais.get(cat, (0,10))[1])) for cat in categories]
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatterpolar(r=values, theta=categories, fill='toself', name='Candidato', line_color='purple'))
-        fig.add_trace(go.Scatterpolar(r=ideal_min, theta=categories, name='Ideal Mín', line=dict(color='green', dash='dash'), mode='lines'))
-        fig.add_trace(go.Scatterpolar(r=ideal_max, theta=categories, name='Ideal Máx', line=dict(color='green', dash='dash'), mode='lines'))
-        fig.update_layout(
-            polar=dict(radialaxis=dict(visible=True, range=[0,10], tickvals=[0,2,4,6,8,10])),
-            showlegend=True,
-            title="Perfil Big Five vs. Ideal do Cargo",
-            height=500
-        )
-        return fig
-    except Exception as e:
-        fig = go.Figure()
-        fig.add_annotation(text=f"Erro no gráfico radar: {str(e)}", xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False, font=dict(size=14, color="red"))
-        fig.update_layout(height=400)
-        return fig
-
-def criar_grafico_competencias(comps: List[Dict]) -> go.Figure:
-    try:
-        if not comps: return None
-        df = pd.DataFrame(comps).sort_values('nota', ascending=False).head(10)
-        fig = go.Figure(go.Bar(x=df['nota'], y=df['nome'], orientation='h', marker_color='purple'))
-        fig.update_layout(title="Top 10 Competências", xaxis_title="Nota", height=400)
-        return fig
-    except Exception:
-        return None
-
-def criar_gauge_fit(fit: float) -> go.Figure:
-    try:
-        fig = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=fit,
-            domain={'x': [0,1], 'y': [0,1]},
-            title={'text': "Fit Geral"},
-            gauge={'axis': {'range': [0,100]},
-                   'bar': {'color': "darkblue"},
-                   'steps': [{'range': [0,50], 'color': "lightgray"},
-                             {'range': [50,80], 'color': "gray"},
-                             {'range': [80,100], 'color': "green"}]}
-        ))
-        fig.update_layout(height=300)
-        return fig
-    except Exception:
-        return None
-
-# ======== PDF Deluxe ========
-class PDFReport(FPDF):
-    def __init__(self):
-        super().__init__()
-        self._family = "Arial"
-        self._main_font = True
-
-    def set_main_family(self, family: str, montserrat_ok: bool):
-        self._family = family if montserrat_ok else "Arial"
-        self._main_font = montserrat_ok
-
-    def _safe(self, text: str) -> str:
-        return str(text or "").encode('latin-1', 'replace').decode('latin-1')
-
-    def header(self):
-        if self.page_no() > 1:
-            self.set_font(self._family, 'I', 8)
-            self.cell(0, 10, 'Elder Brain Analytics — Relatório Confidencial', 0, 1, 'C')
-            self.ln(5)
-
-    def footer(self):
-        self.set_y(-15)
-        self.set_font(self._family, 'I', 8)
-        self.cell(0, 10, f'Página {self.page_no()}', 0, 0, 'C')
-
-def gerar_pdf_corporativo(bfa_data: Dict, analysis: Dict, cargo: str, save_path: str = None, logo_path: str = None) -> io.BytesIO:
-    try:
-        pdf = PDFReport()
-        montserrat_ok = _register_montserrat(pdf)
-        pdf.set_main_family("Montserrat" if montserrat_ok else "Arial", montserrat_ok)
-        pdf.add_page()
-
-        if logo_path and os.path.exists(logo_path):
-            pdf.image(logo_path, x=10, y=8, w=30)
-        pdf.set_font(pdf._family, 'B', 16)
-        pdf.cell(0, 10, pdf._safe('RELATÓRIO DE ANÁLISE COMPORTAMENTAL'), ln=1, align='C')
-        pdf.set_font(pdf._family, '', 12)
-        pdf.cell(0, 10, pdf._safe(f"Cargo: {cargo}"), ln=1, align='C')
-        pdf.ln(5)
-
-        pdf.set_font(pdf._family, 'B', 12)
-        pdf.cell(0, 8, pdf._safe('Resumo Executivo'), ln=1)
-        pdf.set_font(pdf._family, '', 10)
-        pdf.multi_cell(0, 5, pdf._safe(analysis.get('resumo_executivo', '')))
-        pdf.ln(5)
-
-        pdf.set_font(pdf._family, 'B', 12)
-        pdf.cell(0, 8, pdf._safe('Decisão Recomendada'), ln=1)
-        pdf.set_font(pdf._family, '', 10)
-        decisao = analysis.get('decisao', 'N/A')
-        pdf.cell(0, 5, pdf._safe(f"{decisao} - {analysis.get('justificativa_decisao', '')}"), ln=1)
-        pdf.ln(5)
-
-        pdf.set_font(pdf._family, 'B', 12)
-        pdf.cell(0, 8, pdf._safe('Análise dos Traços Big Five'), ln=1)
-        traits = bfa_data.get('traits_bfa', {})
-        for trait, value in traits.items():
-            if value is not None:
-                pdf.set_font(pdf._family, 'B', 10)
-                pdf.cell(0, 6, pdf._safe(f"{trait}: {value:.1f}/10"), ln=1)
-                pdf.set_font(pdf._family, '', 9)
-                pdf.multi_cell(0, 5, pdf._safe(analysis.get('analise_tracos', {}).get(trait, '')))
-        pdf.ln(5)
-
-        pdf.set_font(pdf._family, 'B', 12)
-        pdf.cell(0, 8, pdf._safe('Competências Críticas'), ln=1)
-        for comp in analysis.get('competencias_criticas', []):
-            pdf.set_font(pdf._family, 'B', 10)
-            pdf.cell(0, 6, pdf._safe(f"{comp.get('competencia')}: {comp.get('status')}"), ln=1)
-            pdf.set_font(pdf._family, '', 9)
-            pdf.multi_cell(0, 5, pdf._safe(comp.get('avaliacao', '')))
-        pdf.ln(5)
-
-        pdf.set_font(pdf._family, 'B', 12)
-        pdf.cell(0, 8, pdf._safe('Saúde Emocional'), ln=1)
-        pdf.set_font(pdf._family, '', 10)
-        pdf.multi_cell(0, 5, pdf._safe(analysis.get('saude_emocional_contexto', '')))
-        pdf.ln(5)
-
-        pdf.set_font(pdf._family, 'B', 12)
-        pdf.cell(0, 8, pdf._safe('Recomendações de Desenvolvimento'), ln=1)
-        pdf.set_font(pdf._family, '', 10)
-        for rec in analysis.get('recomendacoes_desenvolvimento', []):
-            pdf.cell(0, 5, pdf._safe(f"- {rec}"), ln=1)
-        pdf.ln(5)
-
-        pdf.set_font(pdf._family, 'B', 12)
-        pdf.cell(0, 8, pdf._safe('Cargos Alternativos'), ln=1)
-        for alt in analysis.get('cargos_alternativos', []):
-            pdf.set_font(pdf._family, 'B', 10)
-            pdf.cell(0, 6, pdf._safe(alt.get('cargo', '')), ln=1)
-            pdf.set_font(pdf._family, '', 9)
-            pdf.multi_cell(0, 5, pdf._safe(alt.get('justificativa', '')))
-
-        pdf.ln(2); pdf.set_font(pdf._family,'I',8)
-        pdf.multi_cell(0,4,pdf._safe("Este relatório auxilia a decisão e não substitui avaliação profissional. Uso interno — Elder Brain Analytics PRO."))
-
-        out_bytes = pdf.output(dest='S')
-        if isinstance(out_bytes, str): out_bytes = out_bytes.encode('latin-1','replace')
-        buf = io.BytesIO(out_bytes); buf.seek(0)
-        if save_path:
+        # Tenta achar JSON
+        m = re.search(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', raw, re.DOTALL)
+        if m:
             try:
-                with open(save_path,'wb') as f: f.write(buf.getbuffer())
-            except Exception as e:
-                st.error(f"Erro ao salvar PDF: {e}")
-        return buf
+                parsed = json.loads(m.group(0))
+                return parsed, raw
+            except json.JSONDecodeError:
+                for cand in re.findall(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', raw, re.DOTALL):
+                    try:
+                        return json.loads(cand), raw
+                    except json.JSONDecodeError:
+                        continue
+        return None, f"Nenhum JSON válido encontrado: {raw[:500]}..."
     except Exception as e:
-        st.error(f"Erro crítico na geração do PDF: {e}")
-        return io.BytesIO(b'%PDF-1.4\n%EOF\n')
+        err = f"[Erro Groq] {str(e)}"
+        if hasattr(e, 'response') and hasattr(e.response, 'text'):
+            try:
+                j = json.loads(e.response.text)
+                if 'error' in j and 'message' in j['error']:
+                    err += f" - {j['error']['message']}"
+            except:
+                err += f" - Resposta: {e.response.text}"
+        return None, err
 
-# ======== Chat com Elder Brain ========
-CHAT_PROMPT = """Você é o Elder Brain, especialista em análise comportamental.
+def analyze_bfa_data(
+    bfa_data: Dict,
+    cargo: str,
+    model_id: str,
+    token: str,
+    temperature: float,
+    max_tokens: int
+) -> Tuple[Optional[Dict], str]:
+    if not token:
+        return None, "Groq API Key não informada"
+    if not model_id.strip():
+        return None, "Modelo não informado"
 
-Dados extraídos: {bfa_data}
-
-Análise: {analysis}
-
-Cargo: {cargo}
-
-Pergunta do usuário: {query}
-
-Responda de forma concisa e profissional."""
-
-def chat_with_elder_brain(query: str, bfa_data: Dict, analysis: Dict, cargo: str,
-                          provider: str, model_id: str, token: str, tracker: TokenTracker) -> str:
     try:
-        client = get_llm_client_cached(provider, token)
+        client = get_groq_client_cached(token)
     except Exception as e:
-        return f"[Erro cliente] {e}"
+        return None, f"[Erro cliente] {e}"
 
-    prompt = (CHAT_PROMPT
-              .replace("{bfa_data}", json.dumps(bfa_data, ensure_ascii=False))
-              .replace("{analysis}", json.dumps(analysis, ensure_ascii=False))
-              .replace("{cargo}", cargo)
-              .replace("{query}", query))
-
-    try:
-        content, usage = _chat_completion_json(provider, client, model_id.strip(), [{"role": "user", "content": prompt}], False)
-        _estimate_and_add(tracker, "chat", [{"role":"user","content":prompt}], content, usage)
-        return content
-    except Exception as e:
-        return f"[Erro no chat] {e}"
-
-# ======== UI Helper (CORRIGIDO) ========
-def kpi_card(title, value, sub=None):
-    st.markdown(
-        f'<div class="kpi-card">'
-        f'<div style="font-weight:700;font-size:1.02rem">{title}</div>'
-        f'<div style="font-size:1.9rem;margin:.2rem 0 .25rem 0">{value}</div>'
-        f'<div class="small">{sub or ""}</div>'
-        f'</div>', unsafe_allow_html=True
+    perfil = gerar_perfil_cargo_dinamico(cargo)
+    prompt = ANALYSIS_PROMPT.format(
+        cargo=cargo,
+        json_data=json.dumps(bfa_data, ensure_ascii=False, indent=2),
+        perfil_cargo=json.dumps(perfil, ensure_ascii=False, indent=2),
     )
 
-# ======== APP ========
+    try:
+        resp = client.chat.completions.create(
+            response_format={"type": "json_object"},
+            model=model_id.strip(),
+            messages=[
+                {"role": "system", "content": "Responda ESTRITAMENTE com JSON. Sem markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=int(max_tokens),
+            temperature=float(temperature),
+        )
+        raw = resp.choices[0].message.content.strip()
+
+        # Ajuste se vier com texto fora do JSON
+        if not raw.startswith("{"):
+            raw = re.sub(r'.*?(\{.*\})', r'\1', raw, flags=re.DOTALL).strip()
+
+        parsed = json.loads(raw)
+        return parsed, raw
+    except Exception as e:
+        return None, f"[Erro análise] {e}"
+
+def criar_radar_bfa(traits: Dict[str, Optional[float]], traits_ideais: Dict = None) -> go.Figure:
+    labels = ["Abertura", "Conscienciosidade", "Extroversão", "Amabilidade", "Neuroticismo"]
+    valores = [float(traits.get(k, 0) or 0) for k in labels]
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=valores, theta=labels, fill='toself', name='Candidato', line=dict(color=PALETA["prim_alt"])
+    ))
+    if traits_ideais:
+        vmin = [traits_ideais.get(k, (0, 10))[0] for k in labels]
+        vmax = [traits_ideais.get(k, (0, 10))[1] for k in labels]
+        fig.add_trace(go.Scatterpolar(r=vmax, theta=labels, fill='toself', name='Faixa Ideal (Máx)',
+                                      line=dict(color='rgba(46,213,115,0.35)'), fillcolor='rgba(46,213,115,0.20)'))
+        fig.add_trace(go.Scatterpolar(r=vmin, theta=labels, fill='tonext', name='Faixa Ideal (Mín)',
+                                      line=dict(color='rgba(46,213,115,0.25)'), fillcolor='rgba(46,213,115,0.10)'))
+    fig.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 10])),
+        showlegend=True, height=480, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        title=None
+    )
+    return fig
+
+def criar_grafico_competencias(competencias: List[Dict]) -> Optional[go.Figure]:
+    if not competencias:
+        return None
+    df = pd.DataFrame(competencias)
+    df = df.sort_values('nota', ascending=True).tail(15)
+    cores = [PALETA["err"] if n < 45 else PALETA["warn"] if n < 55 else PALETA["ok"] for n in df['nota']]
+    fig = go.Figure(go.Bar(
+        x=df['nota'], y=df['nome'], orientation='h',
+        marker=dict(color=cores), text=df['nota'].round(0).astype(int), textposition='outside'
+    ))
+    fig.update_layout(
+        height=560, showlegend=False, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=10, r=15, t=10, b=10), xaxis_title="Nota", yaxis_title=""
+    )
+    fig.add_vline(x=45, line_dash="dash", line_color=PALETA["warn"])
+    fig.add_vline(x=55, line_dash="dash", line_color=PALETA["ok"])
+    return fig
+
+def criar_gauge_fit(fit_score: float) -> go.Figure:
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number+delta",
+        value=float(fit_score or 0),
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': "Fit para o Cargo"},
+        delta={'reference': 70, 'increasing': {'color': "green"}},
+        gauge={
+            'axis': {'range': [None, 100]},
+            'bar': {'color': PALETA["prim_alt"]},
+            'bgcolor': "white",
+            'borderwidth': 1,
+            'bordercolor': "#333",
+            'steps': [
+                {'range': [0, 40], 'color': PALETA["err"]},
+                {'range': [40, 70], 'color': PALETA["warn"]},
+                {'range': [70, 100], 'color': PALETA["ok"]}
+            ],
+            'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 70}
+        }
+    ))
+    fig.update_layout(height=360, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
+    return fig
+
+# =============================================================================
+# UI HELPERS
+# =============================================================================
+
+def badge(label: str, ok: bool, hint: str = ""):
+    color = PALETA["ok"] if ok else PALETA["err"]
+    icon = "✅" if ok else "⛔"
+    st.markdown(
+        f"""
+        <div style="background:{PALETA['card']};border:1px solid #222;border-radius:10px;padding:10px 12px;margin-bottom:6px;">
+            <span style="font-size:14px">{icon} <b>{label}</b></span>
+            <span style="color:{PALETA['muted']};font-size:12px;">{ " — " + hint if hint else ""}</span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def status_pipeline(state: dict):
+    st.subheader("🟣 status do processo")
+    badge("API Key informada", state.get("has_token", False), "necessária para as chamadas Groq")
+    badge("Modelo válido", state.get("has_model", False), "ex.: llama-3.1-8b-instant")
+    badge("Cargo definido", state.get("has_role", False))
+    badge("PDF carregado", state.get("has_pdf", False))
+    badge("Extração concluída", state.get("extracted", False))
+    badge("Análise concluída", state.get("analyzed", False))
+    badge("PDF gerado", state.get("pdf_ready", False))
+
+def inject_css():
+    st.markdown(
+        f"""
+        <style>
+            .stApp {{
+                background: linear-gradient(180deg, {PALETA['bg']}, #0b0f14);
+            }}
+            .block-container {{
+                padding-top: 1.2rem;
+                padding-bottom: 3rem;
+            }}
+            .stTabs [data-baseweb="tab-list"] button {{
+                font-weight: 600;
+            }}
+            .metric-card {{
+                background: {PALETA['card']};
+                border: 1px solid #222;
+                border-radius: 14px;
+                padding: 14px;
+            }}
+            .headline {{
+                font-size: 1.7rem;
+                font-weight: 800;
+                color: #fff;
+            }}
+            .subtle {{
+                color: {PALETA['muted']};
+            }}
+            .divider {{
+                height: 1px; background: #202635; margin: 10px 0 14px 0;
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+# =============================================================================
+# APP
+# =============================================================================
+
 def main():
-    st.set_page_config(page_title="EBA — Corporate PROD", page_icon="brain", layout="wide")
-    st.markdown(DARK_CSS, unsafe_allow_html=True)
+    st.set_page_config(page_title=APP_NAME, page_icon="🧠", layout="wide", initial_sidebar_state="expanded")
+    inject_css()
 
+    # ---------- HEADER ----------
+    st.markdown(f"<div class='headline'>🧠 {APP_NAME}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='subtle'>{APP_TAGLINE}</div>", unsafe_allow_html=True)
+    st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+
+    # Session state base
     ss = st.session_state
-    ss.setdefault('provider', "Groq")
-    ss.setdefault('modelo', "llama-3.1-8b-instant")
-    ss.setdefault('cargo', "")
-    ss.setdefault('analysis_complete', False)
-    ss.setdefault('bfa_data', None)
-    ss.setdefault('analysis', None)
-    ss.setdefault('pdf_generated', None)
-    ss.setdefault('tracker', TokenTracker())
-    ss.setdefault('admin_mode', False)
-    ss.setdefault('session_id', str(uuid.uuid4()))
-    ss.setdefault('email_mode', 'cada_uso')
+    if "analysis_complete" not in ss: ss.analysis_complete = False
+    if "bfa_data" not in ss: ss.bfa_data = None
+    if "analysis" not in ss: ss.analysis = None
+    if "cargo_final" not in ss: ss.cargo_final = ""
+    if "pdf_generated" not in ss: ss.pdf_generated = None
+    if "modelo_selecionado" not in ss: ss.modelo_selecionado = "llama-3.1-8b-instant"
 
-    st.markdown("## Elder Brain Analytics — Corporate (PROD • Full)")
-    st.markdown('<span class="badge">PDF Deluxe</span> <span class="badge">Seguro</span> <span class="badge">Gratuito</span>', unsafe_allow_html=True)
-
+    # ---------- SIDEBAR ----------
     with st.sidebar:
-        st.header("Configuração")
-        provider = st.radio("Provedor", ["Groq","OpenAI"], index=0, key="provider")
-        modelo = st.text_input("Modelo", value=ss['modelo'], help="Ex: llama-3.1-8b-instant")
-        ss['modelo'] = modelo
-        token = st.secrets.get("GROQ_API_KEY","") if provider=="Groq" else st.secrets.get("OPENAI_API_KEY","")
-        st.caption("Temp: 0.3 · Max tokens: 4096")
-        ss['cargo'] = st.text_input("Cargo para análise", value=ss['cargo'])
-        if ss['cargo']:
-            with st.expander("Perfil Ideal"):
-                st.json(gerar_perfil_cargo_dinamico(ss['cargo']))
+        st.header("⚙️ configuração")
+        modelo_input = st.text_input(
+            "Modelo Groq",
+            value=ss.modelo_selecionado,
+            placeholder="ex.: llama-3.1-8b-instant",
+            help="Sugestões: " + ", ".join(MODELOS_SUGERIDOS)
+        )
+        if modelo_input:
+            ss.modelo_selecionado = modelo_input
+
+        groq_token = st.text_input("Groq API Key", type="password", placeholder="gsk_xxx...")
+        temp = st.slider("Temperatura", 0.0, 1.0, 0.1, 0.05)
+        max_tokens = st.slider("Tokens máximos", 512, 3072, 1500, 128)
 
         st.markdown("---")
-        st.subheader("Painel Administrativo")
-        admin_pwd = st.text_input("Senha Admin", type="password")
-        if admin_pwd == st.secrets.get("ADMIN_PASSWORD", ""):
-            ss['admin_mode'] = True
-            st.success("Acesso concedido")
-            ss['email_mode'] = st.selectbox("Notificações", ["cada_uso", "soma"], help="E-mail por step ou total")
-        else:
-            ss['admin_mode'] = False
+        st.header("🎯 análise")
+        cargo_input = st.text_input("Cargo para análise", value=ss.cargo_final, placeholder="ex.: Gerente Comercial")
+        if cargo_input:
+            ss.cargo_final = cargo_input
+            with st.expander("perfil gerado para o cargo"):
+                st.json(gerar_perfil_cargo_dinamico(cargo_input))
 
-        if ss['admin_mode']:
-            st.markdown("---")
-            st.header("Token Log")
-            td = ss['tracker'].dict()
-            for step in ["extracao","analise","chat","pdf"]:
-                d = td.get(step, {"prompt":0,"completion":0,"total":0})
-                st.write(f"- **{step.capitalize()}**: {d['total']} (p:{d['prompt']}/o:{d['completion']})")
-            st.write(f"**Total:** {ss['tracker'].total_tokens} tokens")
-            st.write(f"**Custo:** ${ss['tracker'].cost_usd_gpt():.4f}")
+        st.markdown("---")
+        st.header("ℹ️ como funciona")
+        st.markdown(
+            """
+            1) informe a **API Key** e o **modelo** groq  
+            2) defina o **cargo** da avaliação  
+            3) faça **upload do PDF BFA**  
+            4) clique em **ANALISAR RELATÓRIO**  
+            5) confira **gráficos e decisão**  
+            6) gere o **PDF executivo**
+            """.strip()
+        )
 
-    c1,c2,c3,c4 = st.columns(4)
-    with c1: kpi_card("Status", "Pronto", "Aguardando PDF")
-    if ss['admin_mode']:
-        with c2: kpi_card("Tokens", f"{ss['tracker'].total_tokens}", "total")
-        with c3: kpi_card("P/O", f"{ss['tracker'].total_prompt}/{ss['tracker'].total_completion}", "")
-        with c4: kpi_card("Custo", f"${ss['tracker'].cost_usd_gpt():.4f}", "USD")
-    else:
-        with c2: kpi_card("Relatórios", "—", "")
-        with c3: kpi_card("Andamento", "—", "")
-        with c4: kpi_card("Online", "Sim", "")
+    # ---------- UPLOAD ----------
+    st.subheader("📄 upload do relatório BFA")
+    uploaded_file = st.file_uploader("Carregue o PDF do relatório BFA", type=["pdf"])
 
-    st.markdown("### Upload do Relatório BFA")
-    uploaded_file = st.file_uploader("PDF do BFA", type=["pdf"])
+    # ---------- STATUS (antes de rodar) ----------
+    state_flags = {
+        "has_token": bool(groq_token),
+        "has_model": bool(ss.modelo_selecionado and ss.modelo_selecionado.strip()),
+        "has_role": bool(ss.cargo_final),
+        "has_pdf": bool(uploaded_file),
+        "extracted": bool(ss.bfa_data),
+        "analyzed": bool(ss.analysis_complete and ss.analysis),
+        "pdf_ready": bool(ss.pdf_generated),
+    }
+    status_pipeline(state_flags)
+    st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
 
-    with st.expander("Materiais de Treinamento (Opcional)"):
-        training_files = st.file_uploader("PDFs/TXTs", accept_multiple_files=True, key="training")
-        if training_files:
-            for f in training_files:
-                save_path = os.path.join(TRAINING_DIR, f"{int(time.time())}_{f.name}")
-                with open(save_path, "wb") as out:
-                    out.write(f.getbuffer())
-            st.success("Arquivos salvos")
-
+    # ---------- PROCESSAMENTO ----------
     if uploaded_file:
-        if not ss['cargo']: st.error("Informe o cargo"); st.stop()
-        if not token: st.error("API key ausente"); st.stop()
+        if not ss.cargo_final:
+            st.error("⚠️ Insira o cargo na sidebar.")
+            st.stop()
+        if not groq_token:
+            st.error("⚠️ Insira a Groq API Key na sidebar.")
+            st.stop()
+        if not ss.modelo_selecionado.strip():
+            st.error("⚠️ Informe um modelo Groq válido.")
+            st.stop()
 
-        with st.spinner("Extraindo texto..."):
+        # Extração
+        with st.spinner("🔍 extraindo texto do PDF..."):
             raw_text = extract_pdf_text_bytes(uploaded_file)
-        if raw_text.startswith("[ERRO"): st.error(raw_text); st.stop()
-        st.success("Texto extraído")
-        st.text_area("Prévia", raw_text[:1500], height=180)
+        if raw_text.startswith("[ERRO"):
+            st.error(raw_text)
+            st.stop()
 
-        if st.button("ANALISAR RELATÓRIO", type="primary", use_container_width=True):
-            training_context = load_all_training_texts()
-            tracker: TokenTracker = ss['tracker']
-            tracker.model, tracker.provider = ss['modelo'], ss['provider']
+        # Etapa 1
+        if st.button("🔬 ANALISAR RELATÓRIO", type="primary", use_container_width=True):
+            with st.spinner("Etapa 1/2: Extraindo dados estruturados..."):
+                bfa_data, raw_extraction = extract_bfa_data(
+                    raw_text, ss.cargo_final, ss.modelo_selecionado, groq_token, temp, max_tokens
+                )
 
-            with st.spinner("Extraindo dados..."):
-                bfa_data, raw1 = extract_bfa_data(raw_text, ss['cargo'], training_context, ss['provider'], ss['modelo'], token, tracker)
-                if ss['admin_mode']: send_admin_notification(tracker, "extracao", ss['cargo'], ss['email_mode'])
-            if not bfa_data: st.error("Falha na extração"); st.code(raw1); st.stop()
+            if not bfa_data:
+                st.error("❌ Falha na extração de dados")
+                with st.expander("ver resposta bruta"):
+                    st.code(raw_extraction)
+                st.stop()
 
-            perfil = gerar_perfil_cargo_dinamico(ss['cargo'])
-            with st.spinner("Analisando..."):
-                analysis, raw2 = analyze_bfa_data(bfa_data, ss['cargo'], perfil, ss['provider'], ss['modelo'], token, tracker)
-                if ss['admin_mode']:
-                    if ss['email_mode'] == 'cada_uso':
-                        send_admin_notification(tracker, "analise", ss['cargo'], ss['email_mode'])
-                    else:
-                        send_admin_notification(tracker, "analise", ss['cargo'], "soma")
-            if not analysis: st.error("Falha na análise"); st.code(raw2); st.stop()
+            st.success("✓ Dados extraídos")
+            ss.bfa_data = bfa_data
 
-            ss['bfa_data'], ss['analysis'], ss['analysis_complete'] = bfa_data, analysis, True
-            st.success("Análise concluída!"); st.rerun()
+            # Etapa 2
+            with st.spinner("Etapa 2/2: Analisando compatibilidade..."):
+                analysis, raw_analysis = analyze_bfa_data(
+                    ss.bfa_data, ss.cargo_final, ss.modelo_selecionado, groq_token, temp, max_tokens
+                )
 
-    if ss.get('analysis_complete'):
-        st.markdown("## Resultados")
-        decisao = ss['analysis'].get('decisao','N/A')
-        compat = float(ss['analysis'].get('compatibilidade_geral',0) or 0)
+            if not analysis:
+                st.error("❌ Falha na análise")
+                with st.expander("ver resposta bruta"):
+                    st.code(raw_analysis)
+                st.stop()
 
-        c1,c2,c3 = st.columns([2,1,1])
-        with c1: st.markdown(f"### Decisão: **{decisao}**")
-        with c2: st.metric("Compatibilidade", f"{compat:.0f}%")
-        with c3: st.metric("Liderança", ss['bfa_data'].get('potencial_lideranca','N/A'))
+            ss.analysis = analysis
+            ss.analysis_complete = True
+            st.success("✓ Análise concluída!")
+            st.rerun()
 
-        with st.expander("Resumo Executivo", expanded=True):
-            st.write(ss['analysis'].get('resumo_executivo',''))
-        st.info(ss['analysis'].get('justificativa_decisao',''))
+    # ---------- RESULTADOS ----------
+    if ss.analysis_complete and ss.bfa_data and ss.analysis:
+        decisao = ss.analysis.get('decisao', 'N/A')
+        compat = float(ss.analysis.get('compatibilidade_geral', 0) or 0)
+        potencial = ss.bfa_data.get('potencial_lideranca', 'N/A')
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(["Big Five","Competências","Saúde","Desenvolvimento","Dados Brutos"])
+        # KPIs
+        c1, c2, c3 = st.columns([1.2, 1, 1])
+        with c1:
+            col = {"RECOMENDADO": PALETA["ok"], "RECOMENDADO COM RESSALVAS": PALETA["warn"], "NÃO RECOMENDADO": PALETA["err"]}.get(decisao, "#6b7280")
+            st.markdown(
+                f"<div class='metric-card'><div style='font-weight:700;color:{col};font-size:1.2rem'>{decisao}</div><div class='subtle'>decisão de contratação</div></div>",
+                unsafe_allow_html=True
+            )
+        with c2:
+            st.metric("Compatibilidade", f"{compat:.0f}%")
+        with c3:
+            st.metric("Liderança", potencial)
+
+        st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+
+        # TABS
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["🎯 Big Five", "💼 Competências", "🧘 Saúde Emocional", "📈 Desenvolvimento", "📄 JSON Bruto"])
+
         with tab1:
-            raw_traits = ss['bfa_data'].get('traits_bfa', {})
-            traits = limpar_traits_para_grafico(raw_traits)
-            perfil_ideal = gerar_perfil_cargo_dinamico(ss['cargo']).get('traits_ideais', {})
-            fig_radar = criar_radar_bfa(traits, perfil_ideal)
+            st.subheader("Traços de Personalidade (Big Five)")
+            traits = ss.bfa_data.get('traits_bfa', {}) or {}
+            perfil = gerar_perfil_cargo_dinamico(ss.cargo_final)
+            fig_radar = criar_radar_bfa(traits, perfil.get('traits_ideais', {}))
             st.plotly_chart(fig_radar, use_container_width=True)
 
-            df_traits = pd.DataFrame([
-                {'Traço': k, 'Valor': f"{traits.get(k,0):.1f}/10", 'Ideal': f"{perfil_ideal.get(k,(0,10))[0]}-{perfil_ideal.get(k,(0,10))[1]}"}
-                for k in ["Abertura", "Conscienciosidade", "Extroversão", "Amabilidade", "Neuroticismo"]
-            ])
-            st.dataframe(df_traits, use_container_width=True, hide_index=True)
-
-            st.markdown("##### Análise Detalhada")
-            for trait, txt in (ss['analysis'].get('analise_tracos',{}) or {}).items():
-                with st.expander(f"**{trait}**"):
-                    st.write(txt)
+            analise_tracos = ss.analysis.get('analise_tracos', {}) or {}
+            if analise_tracos:
+                with st.expander("análises por traço"):
+                    for k, v in analise_tracos.items():
+                        st.markdown(f"**{k}** — {v}")
 
         with tab2:
-            comps = ss['bfa_data'].get('competencias_ms',[])
-            figc = criar_grafico_competencias(comps)
-            if figc: st.plotly_chart(figc, use_container_width=True)
-            st.markdown("##### Competências Críticas")
-            for comp in ss['analysis'].get('competencias_criticas',[]):
-                status = comp.get('status'); compn = comp.get('competencia'); txt = comp.get('avaliacao','')
-                if status == 'ATENDE': st.success(f"OK {compn} — {status}"); st.caption(txt)
-                elif status == 'PARCIAL': st.warning(f"Warning {compn} — {status}"); st.caption(txt)
-                else: st.error(f"Error {compn} — {status}"); st.caption(txt)
-            if comps:
-                with st.expander("Ver todas"):
-                    df_comp = pd.DataFrame(comps).sort_values('nota', ascending=False)
-                    st.dataframe(df_comp, use_container_width=True, hide_index=True)
+            st.subheader("Competências")
+            competencias = ss.bfa_data.get('competencias_ms', []) or []
+            figc = criar_grafico_competencias(competencias)
+            if figc:
+                st.plotly_chart(figc, use_container_width=True)
+
+            crit = ss.analysis.get('competencias_criticas', []) or []
+            if crit:
+                st.markdown("**Competências Críticas**")
+                for c in crit:
+                    status = c.get('status', '')
+                    ic = "✅" if status == "ATENDE" else ("⚠️" if status == "PARCIAL" else "❌")
+                    st.markdown(f"- {ic} **{c.get('competencia','')}** — {status}")
+                    if c.get('avaliacao'):
+                        st.caption(c['avaliacao'])
 
         with tab3:
-            st.subheader("Saúde Emocional")
-            st.write(ss['analysis'].get('saude_emocional_contexto',''))
-            indicadores = ss['bfa_data'].get('indicadores_saude_emocional',{})
+            st.subheader("Saúde Emocional e Resiliência")
+            st.markdown(ss.analysis.get('saude_emocional_contexto', ''))
+            indicadores = ss.bfa_data.get('indicadores_saude_emocional', {}) or {}
             if any(v is not None for v in indicadores.values()):
                 cols = st.columns(2)
-                for i,(k,v) in enumerate(indicadores.items()):
-                    if v is None: continue
-                    with cols[i%2]: st.metric(k.replace('_',' ').title(), f"{float(v):.0f}")
+                for i, (nome, valor) in enumerate(indicadores.items()):
+                    if valor is not None:
+                        with cols[i % 2]:
+                            limite = 55
+                            delta = (limite - float(valor)) if float(valor) <= limite else (float(valor) - limite)
+                            color = 'inverse' if float(valor) <= limite else 'normal'
+                            st.metric(nome.replace("_", " ").title(), f"{float(valor):.0f}", f"{delta:.0f}", delta_color=color)
 
         with tab4:
-            st.subheader("Desenvolvimento")
-            for i,r in enumerate(ss['analysis'].get('recomendacoes_desenvolvimento',[]),1):
-                st.markdown(f"**{i}.** {r}")
-            pf = ss['bfa_data'].get('pontos_fortes',[])
+            st.subheader("Plano de Desenvolvimento")
+            recs = ss.analysis.get('recomendacoes_desenvolvimento', []) or []
+            if recs:
+                for i, r in enumerate(recs, 1):
+                    st.markdown(f"**{i}.** {r}")
+
+            pf = ss.bfa_data.get('pontos_fortes', []) or []
             if pf:
-                st.markdown("##### Pontos Fortes")
-                for x in pf: st.success(f"• {x}")
-            pa = ss['bfa_data'].get('pontos_atencao',[])
+                st.markdown("**✅ Pontos Fortes**")
+                for t in pf: st.success(f"• {t}")
+            pa = ss.bfa_data.get('pontos_atencao', []) or []
             if pa:
-                st.markdown("##### Pontos de Atenção")
-                for x in pa: st.warning(f"• {x}")
+                st.markdown("**⚠️ Pontos de Atenção**")
+                for t in pa: st.warning(f"• {t}")
 
         with tab5:
-            c1,c2 = st.columns(2)
-            with c1: st.json(ss['bfa_data'])
-            with c2: st.json(ss['analysis'])
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Dados Extraídos**")
+                st.json(ss.bfa_data)
+            with c2:
+                st.markdown("**Análise Completa**")
+                st.json(ss.analysis)
 
-        st.markdown("### Compatibilidade")
+        st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+
+        # Gauge
+        st.subheader("🎯 Compatibilidade Geral")
         st.plotly_chart(criar_gauge_fit(compat), use_container_width=True)
 
-        st.markdown("### Gerar PDF")
-        logo_path = st.text_input("Logo (opcional)", "")
-        if st.button("Gerar PDF"):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            nome = re.sub(r'[^\w\s-]', '', ss['bfa_data'].get('candidato',{}).get('nome','candidato')).strip().replace(' ', '_')
-            fname = f"relatorio_{nome}_{ts}.pdf"
-            path = os.path.join(PROCESSED_DIR, fname)
-            buf = gerar_pdf_corporativo(ss['bfa_data'], ss['analysis'], ss['cargo'], save_path=path, logo_path=logo_path or None)
-            ss['tracker'].add("pdf", 0, 0)
-            if ss['admin_mode']: send_admin_notification(ss['tracker'], "pdf", ss['cargo'], ss['email_mode'])
-            if buf.getbuffer().nbytes > 100:
-                ss['pdf_generated'] = {'buffer': buf, 'filename': fname}
-                st.success("PDF gerado")
-        if ss.get('pdf_generated'):
-            st.download_button("Download PDF", data=ss['pdf_generated']['buffer'].getvalue(), file_name=ss['pdf_generated']['filename'], mime="application/pdf")
+        # PDF
+        st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+        st.subheader("📄 Relatório em PDF")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.info("Gere um relatório executivo em PDF com a análise completa.")
+        with col2:
+            if st.button("🔨 Gerar PDF", use_container_width=True, key="btn_pdf"):
+                with st.spinner("Gerando PDF..."):
+                    try:
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        nome = ss.bfa_data.get('candidato', {}).get('nome')
+                        if not isinstance(nome, str) or not nome.strip():
+                            nome = "candidato"
+                        nome = re.sub(r'[^\w\s-]', '', nome).strip().replace(' ', '_')
+                        pdf_filename = f"relatorio_{nome}_{timestamp}.pdf"
+                        pdf_path = os.path.join(PROCESSED_DIR, pdf_filename)
+                        buf = gerar_pdf_profissional(ss.bfa_data, ss.analysis, ss.cargo_final, save_path=pdf_path)
 
-        st.markdown("### Chat com Elder Brain")
-        q = st.text_input("Pergunte")
-        if q and st.button("Enviar"):
-            with st.spinner("Pensando..."):
-                ans = chat_with_elder_brain(q, ss['bfa_data'], ss['analysis'], ss['cargo'], ss['provider'], ss['modelo'], token, ss['tracker'])
-                if ss['admin_mode']: send_admin_notification(ss['tracker'], "chat", ss['cargo'], ss['email_mode'])
-            st.markdown(f"**Você:** {q}\n**Elder Brain:** {ans}")
+                        if buf.getbuffer().nbytes > 100:
+                            ss.pdf_generated = {'buffer': buf, 'filename': pdf_filename}
+                            st.success(f"✓ PDF gerado: {pdf_filename}")
+                            st.rerun()
+                        else:
+                            st.error("❌ PDF vazio. Tente novamente.")
+                    except Exception as e:
+                        st.error(f"Erro na geração do PDF: {e}")
 
+        if ss.pdf_generated:
+            st.download_button(
+                "⬇️ Download do Relatório PDF",
+                data=ss.pdf_generated['buffer'].getvalue(),
+                file_name=ss.pdf_generated['filename'],
+                mime="application/pdf",
+                use_container_width=True
+            )
+
+    # ---------- FOOTER ----------
+    st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
+    st.caption("© Elder Brain Analytics • UI corporativa • build sem chat/preview/treinamento")
+
+# =============================================================================
+# RUN
+# =============================================================================
 if __name__ == "__main__":
     main()
